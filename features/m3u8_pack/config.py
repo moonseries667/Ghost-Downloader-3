@@ -45,7 +45,6 @@ class M3U8Config(PackConfig):
     shouldBinaryMerge = ConfigItem("M3U8", "BinaryMerge", False, BoolValidator())
     shouldCheckSegmentsCount = ConfigItem("M3U8", "CheckSegmentsCount", True, BoolValidator())
     shouldKeepLiveSegments = ConfigItem("M3U8", "LiveKeepSegments", False, BoolValidator())
-    shouldUseLivePipeMux = ConfigItem("M3U8", "LivePipeMux", False, BoolValidator())
     shouldFixLiveVtt = ConfigItem("M3U8", "LiveFixVtt", False, BoolValidator())
     liveWaitTime = RangeConfigItem("M3U8", "LiveWaitTime", 0, RangeValidator(0, 100000))
     liveTakeCount = RangeConfigItem("M3U8", "LiveTakeCount", 0, RangeValidator(0, 1000))
@@ -102,8 +101,6 @@ class M3U8Config(PackConfig):
                 self.tr("下载完成后检查实际分片数是否与预期一致"), self.shouldCheckSegmentsCount, m3u8Group),
             SwitchSettingCard(FluentIcon.SAVE, self.tr("直播保留原始分片"),
                 self.tr("实时合并录制时仍保留下载的原始分片"), self.shouldKeepLiveSegments, m3u8Group),
-            SwitchSettingCard(FluentIcon.CODE, self.tr("直播管道混流"),
-                self.tr("录制时通过管道交给 ffmpeg 实时混流为封装容器"), self.shouldUseLivePipeMux, m3u8Group),
             SwitchSettingCard(FluentIcon.FONT, self.tr("直播校正 VTT 字幕"),
                 self.tr("根据音频起始时间校正 VTT 字幕时间轴"), self.shouldFixLiveVtt, m3u8Group),
             SpinBoxSettingCard(FluentIcon.STOP_WATCH, self.tr("直播刷新等待时间"),
@@ -131,8 +128,8 @@ class M3U8Config(PackConfig):
                 self.tr("把图形字幕转图片后保留原始分片"), self.shouldKeepImageSegments, m3u8Group),
             SwitchSettingCard(FluentIcon.DELETE, self.tr("完成后删除临时文件"),
                 self.tr("下载完成后删除分片临时目录"), self.shouldDeleteTemp, m3u8Group),
-            SwitchSettingCard(FluentIcon.MUSIC, self.tr("下载全部音轨与字幕"),
-                self.tr("默认拉取全部音频与字幕轨道"), self.shouldSelectAllAudioSubtitle, m3u8Group),
+            SwitchSettingCard(FluentIcon.MUSIC, self.tr("下载全部音轨"),
+                self.tr("默认拉取全部音频轨道"), self.shouldSelectAllAudioSubtitle, m3u8Group),
             LineEditSettingCard(FluentIcon.VIDEO, self.tr("自定义混流参数"),
                 self.tr("自定义 --mux-after-done，留空则按输出容器自动混流"),
                 self.customMuxAfterDone, m3u8Group, placeholder="format=mp4"),

@@ -5,8 +5,9 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from app.i18n import N
+
 from .account import (
-    BilibiliAccount,
     QR_EXPIRED,
     QR_GOT_URL,
     QR_LOGIN_FAILED,
@@ -16,6 +17,7 @@ from .account import (
 )
 
 if TYPE_CHECKING:
+    from .account import BilibiliAccount
     from app.signal import Signal
     from .pack import BilibiliPack
     from .task import BilibiliTask
@@ -78,7 +80,7 @@ def fileFields(task: BilibiliTask) -> dict[int, dict[str, int]]:
     }
 
 
-def applyFileEdits(task: BilibiliTask, edits: dict[str, Any]) -> None:
+def applyFileEdits(task: BilibiliTask, edits: dict) -> None:
     from .task import setTimeRanges
 
     trim = {int(i): (v[0], v[1]) for i, v in (edits.get("trim") or {}).items()}
@@ -97,8 +99,8 @@ def fileGroups(task: BilibiliTask) -> dict[int, list[str]]:
     }
 
 
-def toDraftOptions(pairs: list[tuple[str, str]]) -> list[dict[str, str]]:
-    return [{"key": key, "label": label} for key, label in pairs]
+def toDraftOptions(pairs: list[tuple[str, str]], **params: Any) -> list[dict]:
+    return [{"key": key, "label": label, "params": params} for key, label in pairs]
 
 
 def activeTracks(task: BilibiliTask) -> set[str]:
@@ -112,7 +114,7 @@ def activeTracks(task: BilibiliTask) -> set[str]:
     }
 
 
-def draftFields(task: BilibiliTask) -> dict[str, Any]:
+def draftFields(task: BilibiliTask) -> dict:
     from .task import (
         DANMAKU_OPTIONS, audioTiers, currentAudioTier, currentVideoTier, subtitleChoices, videoTiers,
     )
@@ -123,21 +125,21 @@ def draftFields(task: BilibiliTask) -> dict[str, Any]:
         "controls": [
             {
                 "id": "video",
-                "title": "视频",
+                "title": N("TrackBar", "视频"),
                 "value": currentVideoTier(task) if task.isVideoEnabled else "",
                 "options": toDraftOptions(videoTiers(task)),
                 "isOptional": bool(tracks - {"video"}),
             },
             {
                 "id": "audio",
-                "title": "音频",
+                "title": N("TrackBar", "音频"),
                 "value": currentAudioTier(task) if task.isAudioEnabled else "",
                 "options": toDraftOptions(audioTiers(task)),
                 "isOptional": bool(tracks - {"audio"}),
             },
             {
                 "id": "danmaku",
-                "title": "弹幕",
+                "title": N("BilibiliDraftCard", "弹幕"),
                 "value": task.danmakuFormat,
                 "options": toDraftOptions(DANMAKU_OPTIONS),
                 "isOptional": bool(tracks - {"danmaku"}),
@@ -145,7 +147,9 @@ def draftFields(task: BilibiliTask) -> dict[str, Any]:
         ],
         "isCoverEnabled": task.isCoverEnabled,
         "hasCover": bool(task.coverUrl),
-        "subtitles": toDraftOptions(subtitleChoices(task)) if task.hasMedia else [],
+        "subtitles": toDraftOptions(
+            subtitleChoices(task, "{auto}"), auto=N("BilibiliDraftCard", "（自动生成）"),
+        ) if task.hasMedia else [],
         "subtitleLanguages": list(task.subtitleLanguages),
         "duration": page._duration if page else 0,
         "startTime": page.startTime if page else 0,
@@ -197,7 +201,7 @@ def setFileName(task: BilibiliTask, index: int, name: str) -> None:
     _setFileName(task, index, name)
 
 
-async def probePreview(task: BilibiliTask) -> dict[str, Any]:
+async def probePreview(task: BilibiliTask) -> dict:
     import re
     from urllib.parse import urlparse
     from app.client import buildClient
@@ -236,7 +240,6 @@ async def probePreview(task: BilibiliTask) -> dict[str, Any]:
 # ---- account state (called by Kotlin via packState/requestPack) ----
 
 def accountState() -> dict[str, bool | str]:
-    assert _account is not None
     return {
         "isLoggedIn": _account.isLoggedIn,
         "username": _account.username,
@@ -251,48 +254,40 @@ def qrState() -> dict[str, str]:
 
 
 def setCookie(cookie: str) -> None:
-    assert _account is not None
     _account.setCookie(cookie)
 
 
 def logout() -> None:
-    assert _account is not None
     _account.logout()
 
 
 def startQrLogin() -> None:
     global _qr, _loginUrl
-    assert _account is not None
     _qr, _loginUrl = QrState(), ""
     _account.startQrLogin()
 
 
 def cancelQrLogin() -> None:
-    assert _account is not None
     _account.cancelQrLogin()
 
 
 async def fetchCaptcha() -> dict[str, str]:
-    assert _account is not None
     return await _account.fetchCaptcha()
 
 
-async def fetchCountries() -> dict[str, Any]:
-    assert _account is not None
+async def fetchCountries() -> dict:
     return await _account.fetchCountries()
 
 
 async def sendSmsCode(cid: int, tel: str, captcha: str) -> None:
-    assert _account is not None
     await _account.sendSmsCode(cid, tel, json.loads(captcha))
 
 
 async def loginSms(cid: int, tel: str, code: str) -> None:
-    assert _account is not None
     await _account.loginSms(cid, tel, code)
 
 
-def _onQrStateChanged(code: int, text: str) -> None:
+def _onQrStateChanged(code: int, text: str):
     global _qr, _loginUrl
     status = QR_STATUS.get(code, "failed")
     if status == "ready":

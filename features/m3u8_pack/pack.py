@@ -4,7 +4,7 @@ import asyncio
 from email.message import Message
 from email.utils import collapse_rfc2231_value
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, unquote, urlparse
 
 import m3u8
@@ -15,11 +15,11 @@ from app.client import buildClient, toEmulation
 from app.config.cfg import cfg
 from app.i18n import N
 
-from app.models.pack import BinaryRuntime, FeaturePack, PackServices, TaskParser, FileType
-from app.models.task import PageTaskOptions, Task, TaskOptions
+from app.models.pack import FeaturePack, TaskParser, FileType
+from app.models.task import PageTaskOptions, ResourceTaskOptions, Task, TaskOptions
 from app.platform.filesystem import localFilePath, toSafeFilename
 from .config import m3u8Config, m3u8Runtime
-from .task import M3U8Task, M3U8TaskStep
+from .task import M3U8SubtitleStep, M3U8Task, M3U8TaskStep
 from .vimeo import buildVimeoFiles, matchVimeoPlaylist
 
 if TYPE_CHECKING:
@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from app.view.cards.draft_cards import DraftCard
     from app.view.cards.task_cards import TaskCard
     from app.view.components.option_cards import OptionCard
+    from app.models.pack import BinaryRuntime, PackServices
 
 
 MEDIA_SUFFIXES = {
@@ -36,6 +37,12 @@ MEDIA_SUFFIXES = {
 MANIFEST_SUFFIXES = {".m3u8", ".m3u", ".mpd"}
 MANIFEST_CONTENT_TYPES = {"application/vnd.apple.mpegurl", "application/x-mpegurl", "application/mpegurl",
                           "audio/mpegurl", "audio/x-mpegurl", "application/dash+xml"}
+# Only the tags we read: m3u8 crashes on vendor attributes in other tags, which RFC 8216 says to ignore.
+READ_TAGS = ("#EXTINF", "#EXT-X-ENDLIST", "#EXT-X-STREAM-INF", "#EXT-X-MEDIA:")
+
+
+def parsePlaylist(body: str, uri: str | None = None) -> m3u8.M3U8:
+    return m3u8.loads(body, uri=uri, custom_tags_parser=lambda line, *_: not line.startswith(READ_TAGS))
 
 
 class M3U8Parser(TaskParser):
@@ -47,7 +54,11 @@ class M3U8Parser(TaskParser):
         lowered = options.url.lower()
         if ".m3u" in lowered or ".mpd" in lowered:
             return True
-        return options.isProbed and options.file.matchType(MANIFEST_SUFFIXES, MANIFEST_CONTENT_TYPES)
+        if not options.isProbed:
+            return False
+        # The MIME alone is enough: parse checks the body and falls back to a plain file.
+        return (Path(options.file.name).suffix.lower() in MANIFEST_SUFFIXES
+                or options.file.contentType in MANIFEST_CONTENT_TYPES)
 
     async def parse(self, options: TaskOptions) -> Task:
         url = options.url.strip()
@@ -99,7 +110,7 @@ class M3U8Parser(TaskParser):
         elif isVimeo:
             isLive = False
         else:
-            playlist = m3u8.loads(body, uri=manifestUrl)
+            playlist = parsePlaylist(body, uri=manifestUrl)
             if playlist.segments:
                 isLive = not playlist.is_endlist
             elif playlist.playlists:
@@ -117,7 +128,7 @@ class M3U8Parser(TaskParser):
                             variantBody = await variantResponse.text()
                         finally:
                             variantClient.close()
-                        isLive = not m3u8.loads(variantBody, uri=variantUrl).is_endlist
+                        isLive = not parsePlaylist(variantBody, uri=variantUrl).is_endlist
                     except Exception as e:
                         logger.warning("取变体清单判活失败, 按点播处理: {}", repr(e))
                         isLive = False
@@ -132,6 +143,8 @@ class M3U8Parser(TaskParser):
         name = ""
         if isinstance(options, PageTaskOptions) and options.pageTitle:
             name = toSafeFilename(options.pageTitle, fallback="")
+        elif isinstance(options, ResourceTaskOptions) and options.name:
+            name = options.name
 
         if not name:
             cd = responseHeaders.get("content-disposition", "")
@@ -173,8 +186,7 @@ class M3U8Parser(TaskParser):
             streams=streams,
         )
 
-        step = M3U8TaskStep(
-            stepIndex=1,
+        stepOptions = dict(
             headers=headers,
 
             threadCount=m3u8Config.threadCount.value,
@@ -186,7 +198,6 @@ class M3U8Parser(TaskParser):
             shouldBinaryMerge=m3u8Config.shouldBinaryMerge.value,
             shouldCheckSegmentsCount=m3u8Config.shouldCheckSegmentsCount.value,
             shouldDeleteTemp=m3u8Config.shouldDeleteTemp.value,
-            outputFormat=m3u8Config.outputFormat.value,
             customMuxAfterDone=m3u8Config.customMuxAfterDone.value,
             subtitleFormat=m3u8Config.subtitleFormat.value,
             shouldSelectAllAudioSubtitle=m3u8Config.shouldSelectAllAudioSubtitle.value,
@@ -199,15 +210,43 @@ class M3U8Parser(TaskParser):
             decryptionBinaryPath=m3u8Config.decryptionBinaryPath.value,
             shouldUseMp4RealTimeDecryption=m3u8Config.shouldUseMp4RealTimeDecryption.value,
             shouldKeepLiveSegments=m3u8Config.shouldKeepLiveSegments.value,
-            shouldUseLivePipeMux=m3u8Config.shouldUseLivePipeMux.value,
             shouldFixLiveVtt=m3u8Config.shouldFixLiveVtt.value,
             liveWaitTime=m3u8Config.liveWaitTime.value,
             liveTakeCount=m3u8Config.liveTakeCount.value,
         )
-        task.addStep(step)
+        task.addStep(M3U8TaskStep(stepIndex=1, **stepOptions))
+        if not isLive:
+            for index, (language, subtitleName) in enumerate(self._parseSubtitles(body, manifestType), start=2):
+                task.addStep(M3U8SubtitleStep(stepIndex=index, language=language, name=subtitleName, **stepOptions))
         return task
 
-    def _parseStreams(self, body: str, manifestType: str) -> list[dict[str, Any]]:
+    def _parseSubtitles(self, body: str, manifestType: str) -> list[tuple[str, str]]:
+        """每种语言取清单中的第一路字幕，返回 (language, name)；language 缺失时以 name 区分。"""
+        try:
+            if manifestType == "mpd":
+                mpd = MPEGDASHParser.parse(body)
+                renditions = [
+                    (adaptationSet.lang or "", adaptationSet.lang or "")
+                    for period in mpd.periods[:1] for adaptationSet in period.adaptation_sets
+                    if (adaptationSet.content_type or "").lower() == "text"
+                    or (adaptationSet.mime_type or "").lower().startswith(("text/", "application/ttml"))
+                ]
+            else:
+                renditions = [
+                    (media.language or "", media.name or "")
+                    for media in parsePlaylist(body).media if (media.type or "").upper() == "SUBTITLES"
+                ]
+        except Exception as e:
+            logger.warning("枚举字幕失败: {}", repr(e))
+            return []
+        subtitles: dict[str, tuple[str, str]] = {}
+        for language, subtitleName in renditions:
+            key = language or subtitleName
+            if key and key not in subtitles:
+                subtitles[key] = (language, subtitleName)
+        return list(subtitles.values())
+
+    def _parseStreams(self, body: str, manifestType: str) -> list[dict]:
         try:
             if manifestType == "mpd":
                 return self._mpdStreams(body)
@@ -216,8 +255,8 @@ class M3U8Parser(TaskParser):
             logger.warning("枚举可选视频流失败: {}", repr(e))
             return []
 
-    def _hlsStreams(self, body: str) -> list[dict[str, Any]]:
-        playlist = m3u8.loads(body)
+    def _hlsStreams(self, body: str) -> list[dict]:
+        playlist = parsePlaylist(body)
         streams = []
         for variant in playlist.playlists:
             resolution = variant.stream_info.resolution
@@ -232,7 +271,7 @@ class M3U8Parser(TaskParser):
             })
         return streams
 
-    def _mpdStreams(self, body: str) -> list[dict[str, Any]]:
+    def _mpdStreams(self, body: str) -> list[dict]:
         mpd = MPEGDASHParser.parse(body)
         if not mpd.periods:
             return []
@@ -292,7 +331,7 @@ class M3U8Pack(FeaturePack):
     def runtimes(self) -> list[BinaryRuntime]:
         return [m3u8Runtime]
 
-    def optionCards(self, task: M3U8Task, parent: QWidget | None = None) -> list[OptionCard]:
+    def optionCards(self, task: Task, parent: QWidget | None = None) -> list[OptionCard]:
         from app.view.components.option_cards import HeadersEditCard, OutputFolderCard
         from .cards import StreamSelectCard, RecordLimitCard, DecryptionKeyCard, MuxImportCard
         from .task import M3U8TaskStep
@@ -313,10 +352,10 @@ class M3U8Pack(FeaturePack):
         cards.append(MuxImportCard(parent, initial=step.muxImports))
         return cards
 
-    def editCards(self, task: M3U8Task, parent: QWidget | None = None) -> list[OptionCard]:
+    def editCards(self, task: Task, parent: QWidget | None = None) -> list[OptionCard]:
         from app.view.components.option_cards import HeadersEditCard, OutputFolderCard
-        from .cards import RecordLimitCard, DecryptionKeyCard, MuxImportCard
-        from .task import M3U8TaskStep
+        from .cards import RecordLimitCard, DecryptionKeyCard, MuxImportCard, SubtitleCard
+        from .task import M3U8TaskStep, subtitleChoices
 
         step = task.steps[0] if task.steps else None
         if not isinstance(step, M3U8TaskStep):
@@ -328,6 +367,8 @@ class M3U8Pack(FeaturePack):
         ]
         if task.isLive:
             cards.append(RecordLimitCard(parent, initial=step.recordLimit))
+        if subtitleChoices(task):
+            cards.append(SubtitleCard(parent, task=task))
         cards.append(DecryptionKeyCard(parent, keys=step.decryptionKeys, keyTextFile=step.decryptionKeyFile))
         cards.append(MuxImportCard(parent, initial=step.muxImports))
         return cards

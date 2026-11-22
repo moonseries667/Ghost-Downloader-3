@@ -75,7 +75,7 @@ class ED2kConfig(PackConfig):
                 return self.tr("未运行")
             if not ed2kSession.isIdle:
                 return self.tr("有 eD2k 任务正在下载或做种，结束后才能终止")
-            return self.tr("开始 eD2k 任务时会自动重新启动")
+            return self.tr("空闲 5 分钟后自动终止，开始 eD2k 任务时会自动重新启动")
 
         stopCard = PushSettingCard(
             self.tr("终止"), FluentIcon.CLOSE, self.tr("终止 Kelpie 进程"), toStopCardContent(), group,
@@ -146,7 +146,7 @@ class ED2kConfig(PackConfig):
         runtimeCard.refreshStatus()
         return [group]
 
-    async def _probeServerText(self) -> tuple[str, dict[str, int]]:
+    async def _probeServerText(self) -> tuple[str, dict]:
         from .session import ed2kSession
         network = ed2kSession.network
         if network is None:
@@ -163,7 +163,7 @@ class ED2kConfig(PackConfig):
             return N("BootstrapList", "已连接服务器（LowID，运营商 NAT，无法获得 HighID）"), {}
         return N("BootstrapList", "已连接服务器（LowID，开启 UPnP 或在路由器转发监听端口可获得 HighID）"), {}
 
-    async def _probeKadText(self) -> tuple[str, dict[str, int]]:
+    async def _probeKadText(self) -> tuple[str, dict]:
         if not self.enableKad.value:
             return N("BootstrapList", "KAD 已关闭"), {}
         from .session import ed2kSession

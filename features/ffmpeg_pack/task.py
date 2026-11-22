@@ -7,7 +7,6 @@ from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
 
 from loguru import logger
 
@@ -219,6 +218,7 @@ class FFmpegStep(TaskStep):
 
     @property
     def outputPath(self) -> str:
+        # 不合并时视频 Step 直接写入成品，本 Step 不运行，不能占用成品路径
         if isinstance(self.task, FFmpegTask) and not (self.task.hasAudio or self.task.isTrimmed):
             return ""
         return self.task.outputPath
@@ -353,7 +353,7 @@ class FFmpegStep(TaskStep):
                     await progressTask
             raise
 
-    async def _readProgress(self, stream: asyncio.StreamReader, totalDuration: float) -> None:
+    async def _readProgress(self, stream: asyncio.StreamReader, totalDuration: float):
         while True:
             rawLine = await stream.readline()
             if not rawLine:
@@ -419,7 +419,7 @@ class FFmpegTask(Task):
 
     @property
     def videoStep(self) -> FFmpegResourceStep:
-        return cast(FFmpegResourceStep, self.steps[0])
+        return self.steps[0]
 
     @property
     def audioStep(self) -> FFmpegResourceStep | None:
@@ -430,7 +430,7 @@ class FFmpegTask(Task):
 
     @property
     def ffmpegStep(self) -> FFmpegStep:
-        return cast(FFmpegStep, self.steps[-1])
+        return self.steps[-1]
 
     @property
     def hasAudio(self) -> bool:
