@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import (
-    POINTER, byref, c_byte, c_int, c_short, c_uint64, c_ulong, c_ushort, c_void_p, c_wchar_p,
+    byref, c_byte, c_int, c_int16, c_int32, c_uint8, c_uint16, c_uint32, c_uint64, c_ulong, c_void_p, c_wchar_p,
 )
 from functools import cache, partial
 
@@ -11,7 +11,32 @@ from loguru import logger
 from app.models.task import TaskStatus
 
 
+class GUID(ctypes.Structure):
+    _fields_ = [("Data1", c_uint32), ("Data2", c_uint16), ("Data3", c_uint16), ("Data4", c_uint8 * 8)]
+
+
+class PROPERTYKEY(ctypes.Structure):
+    _fields_ = [("fmtid", GUID), ("pid", c_uint32)]
+
+
+class PROPVARIANT_VALUE(ctypes.Union):
+    # 占位成员对应 SDK 中最大的 BLOB 成员 {ULONG, 指针}，否则 SetValue 复制时越界读
+    _fields_ = [("boolVal", c_int16), ("pwszVal", c_wchar_p), ("reserved", c_void_p * 2)]
+
+
+class PROPVARIANT(ctypes.Structure):
+    _fields_ = [("vt", c_uint16), ("r1", c_uint16), ("r2", c_uint16), ("r3", c_uint16),
+                ("value", PROPVARIANT_VALUE)]
+
+
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [("length", c_uint32), ("flags", c_uint32), ("showCmd", c_uint32),
+                ("ptMinPosition", c_int32 * 2), ("ptMaxPosition", c_int32 * 2),
+                ("rcNormalPosition", c_int32 * 4)]
+
+
 def setWindowsProgress(hwnd: int, status: TaskStatus | None, progress: float | None) -> None:
+    """系统不支持时静默跳过，不抛异常。"""
     taskbarList = createTaskbarList()
     if taskbarList is None:
         return
@@ -28,49 +53,36 @@ def setWindowsProgress(hwnd: int, status: TaskStatus | None, progress: float | N
 
 
 def setWindowAppId(hwnd: int, appId: str | None) -> None:
-    from ctypes import HRESULT, WINFUNCTYPE, wintypes
-
-    class GUID(ctypes.Structure):
-        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
-                    ("Data3", wintypes.WORD), ("Data4", wintypes.BYTE * 8)]
-
-    class PROPERTYKEY(ctypes.Structure):
-        _fields_ = [("fmtid", GUID), ("pid", wintypes.DWORD)]
-
-    class PROPVARIANT_VALUE(ctypes.Union):
-        _fields_ = [("boolVal", c_short), ("pwszVal", c_wchar_p)]
-
-    class PROPVARIANT(ctypes.Structure):
-        _fields_ = [("vt", c_ushort), ("r1", c_ushort), ("r2", c_ushort), ("r3", c_ushort), ("value", PROPVARIANT_VALUE)]
+    """系统不支持时静默跳过，不抛异常。"""
+    from ctypes import HRESULT, WINFUNCTYPE, oledll
 
     VT_EMPTY, VT_BOOL, VT_LPWSTR = 0, 11, 31
-    shell32 = ctypes.windll.shell32
-    shell32.SHGetPropertyStoreForWindow.argtypes = [
-        wintypes.HWND, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)]
-    shell32.SHGetPropertyStoreForWindow.restype = HRESULT
     store = ctypes.c_void_p()
     iid = GUID(0x886D8EEB, 0x8CF2, 0x4446, (0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99))
-    if shell32.SHGetPropertyStoreForWindow(hwnd, ctypes.byref(iid), ctypes.byref(store)):
-        logger.warning("无法取得窗口属性: {}", ctypes.GetLastError())
+    try:
+        oledll.shell32.SHGetPropertyStoreForWindow(c_void_p(hwnd), ctypes.byref(iid), ctypes.byref(store))
+    except OSError as e:
+        logger.warning("无法取得窗口属性: {}", e)
         return
-    vtable = ctypes.POINTER(ctypes.c_void_p).from_address(store.value)
-    setValue = WINFUNCTYPE(HRESULT, c_void_p, ctypes.POINTER(PROPERTYKEY), ctypes.POINTER(PROPVARIANT))(vtable[6])
-    release = WINFUNCTYPE(c_ulong, c_void_p)(vtable[2])
+    setValue = WINFUNCTYPE(HRESULT, ctypes.POINTER(PROPERTYKEY), ctypes.POINTER(PROPVARIANT))(6, "SetValue")
+    release = WINFUNCTYPE(c_ulong)(2, "Release")
     fmtid = GUID(0x9F4C2855, 0x9F79, 0x4B39, (0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3))
 
     def put(pid: int, variant: PROPVARIANT) -> None:
-        key = PROPERTYKEY(fmtid, pid)
-        if setValue(store, ctypes.byref(key), ctypes.byref(variant)):
-            logger.warning("无法设置窗口 AppUserModelID")
+        setValue(store, ctypes.byref(PROPERTYKEY(fmtid, pid)), ctypes.byref(variant))
 
-    if appId is None:
-        put(9, PROPVARIANT(VT_EMPTY))
-        put(5, PROPVARIANT(VT_EMPTY))
-    else:
-        # 先禁止固定，再写 ID。任务栏只在 ID 变化时重新分组
-        put(9, PROPVARIANT(VT_BOOL, value=PROPVARIANT_VALUE(boolVal=-1)))
-        put(5, PROPVARIANT(VT_LPWSTR, value=PROPVARIANT_VALUE(pwszVal=appId)))
-    release(store)
+    try:
+        if appId is None:
+            put(9, PROPVARIANT(VT_EMPTY))
+            put(5, PROPVARIANT(VT_EMPTY))
+        else:
+            # 先禁止固定，再写 ID。任务栏只在 ID 变化时重新分组
+            put(9, PROPVARIANT(VT_BOOL, value=PROPVARIANT_VALUE(boolVal=-1)))
+            put(5, PROPVARIANT(VT_LPWSTR, value=PROPVARIANT_VALUE(pwszVal=appId)))
+    except OSError as e:
+        logger.warning("无法设置窗口 AppUserModelID: {}", e)
+    finally:
+        release(store)
 
 
 def addTaskbarButton(hwnd: int) -> None:
@@ -83,22 +95,14 @@ def addTaskbarButton(hwnd: int) -> None:
 
 def minimizeWithoutActivating(hwnd: int, x: int, y: int, width: int, height: int) -> None:
     # Qt 对 WA_ShowWithoutActivating 的窗口会把 SW_SHOWMINIMIZED 改成 SW_SHOWNOACTIVATE
-    from ctypes import wintypes
-
     addTaskbarButton(hwnd)
-
-    class WINDOWPLACEMENT(ctypes.Structure):
-        _fields_ = [("length", wintypes.UINT), ("flags", wintypes.UINT), ("showCmd", wintypes.UINT),
-                    ("ptMinPosition", wintypes.POINT), ("ptMaxPosition", wintypes.POINT),
-                    ("rcNormalPosition", wintypes.RECT)]
-
     SW_SHOWMINNOACTIVE = 7
     user32 = ctypes.windll.user32
     placement = WINDOWPLACEMENT()
     placement.length = ctypes.sizeof(WINDOWPLACEMENT)
     user32.GetWindowPlacement(hwnd, ctypes.byref(placement))
     placement.showCmd = SW_SHOWMINNOACTIVE
-    placement.rcNormalPosition = wintypes.RECT(x, y, x + width, y + height)
+    placement.rcNormalPosition = (c_int32 * 4)(x, y, x + width, y + height)
     user32.SetWindowPlacement(hwnd, ctypes.byref(placement))
 
 
@@ -115,13 +119,12 @@ def createTaskbarList():
         ole32.CLSIDFromString("{56FDF344-FD6D-11d0-958A-006097C9A090}", byref(clsid))
         ole32.IIDFromString("{EA1AFB91-9E28-4B86-90E9-9E9F8A5EEFAF}", byref(iid))
         ole32.CoCreateInstance(byref(clsid), None, 1, byref(iid), byref(pointer))  # CLSCTX_INPROC_SERVER
+        WINFUNCTYPE(HRESULT)(3, "HrInit")(pointer)
     except OSError as e:
         logger.warning("无法创建 ITaskbarList3: {}", e)
         return None
-    vtable = POINTER(c_void_p).from_address(pointer.value)
-    WINFUNCTYPE(HRESULT, c_void_p)(vtable[3])(pointer)  # HrInit
-    setValue = WINFUNCTYPE(HRESULT, c_void_p, c_void_p, c_uint64, c_uint64)(vtable[9])
-    setState = WINFUNCTYPE(HRESULT, c_void_p, c_void_p, c_int)(vtable[10])
+    setValue = WINFUNCTYPE(HRESULT, c_void_p, c_uint64, c_uint64)(9, "SetProgressValue")
+    setState = WINFUNCTYPE(HRESULT, c_void_p, c_int)(10, "SetProgressState")
     return partial(setState, pointer), partial(setValue, pointer)
 
 

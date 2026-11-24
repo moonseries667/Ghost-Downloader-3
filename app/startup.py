@@ -13,25 +13,31 @@ if TYPE_CHECKING:
 
 def loadResources(application: Application) -> None:
     from PySide6.QtCore import QResource
+    from qfluentwidgets import load as loadQFluentWidgets
     from app.config.paths import EXECUTABLE_DIR
 
+    loadQFluentWidgets(application)
     QResource.registerResource(str(EXECUTABLE_DIR / "app" / "assets" / "resources.rcc"))
     loadTranslators(application)
 
 
 def loadTranslators(application: Application) -> None:
-    from PySide6.QtCore import QLocale, QTranslator
+    from PySide6.QtCore import QLocale, QTranslator, Qt
     from app.config.cfg import cfg
 
     translator = QTranslator(application)
+    if cfg.language.value not in cfg.language.options:
+        cfg.language.value = "Auto"
 
-    def setLocale() -> None:
-        localeName = cfg.language.value.value
+    def setLocale():
+        localeName = cfg.language.value
         locale = QLocale() if localeName == "Auto" else QLocale(localeName)
         application.removeTranslator(translator)
+        application.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
         if locale.name() != "zh_CN":
             if translator.load(locale, "gd3", ".", ":/i18n") or translator.load("gd3.en_US", ":/i18n"):
                 application.installTranslator(translator)
+                application.setLayoutDirection(QLocale(translator.language()).textDirection())
 
     setLocale()
     cfg.language.valueChanged.connect(setLocale)
@@ -80,34 +86,13 @@ def createEngine(application: Application) -> Engine:
 
 def deleteBackupDir() -> None:
     import shutil
-    import sys
-    from app.config.paths import EXECUTABLE_DIR
+    from app.config.paths import APP_DIR
 
-    appDir = EXECUTABLE_DIR.parent.parent if sys.platform == "darwin" else EXECUTABLE_DIR
-    backupDir = appDir.parent / f"{appDir.name}_backup"
+    if "__compiled__" not in globals():
+        return
+    backupDir = APP_DIR.parent / f"{APP_DIR.name}_backup"
     if backupDir.is_dir():
         shutil.rmtree(backupDir, ignore_errors=True)
-
-
-def deleteLegacyAppIdFiles() -> bool:
-    import sys
-    from pathlib import Path
-
-    if sys.platform == "linux":
-        legacyId = "io.github.xiaoyouchr.GhostDownloader"
-        paths = [
-            Path.home() / ".local/share/applications" / f"{legacyId}.desktop",
-            Path.home() / ".local/share/dbus-1/services" / f"{legacyId}.service",
-            Path.home() / ".config/autostart" / f"{legacyId}.desktop",
-        ]
-    elif sys.platform == "darwin":
-        paths = [Path.home() / "Library/LaunchAgents/com.xiaoyouchr.ghostdownloader.plist"]
-    else:
-        return False
-    existing = [path for path in paths if path.exists()]
-    for path in existing:
-        path.unlink()
-    return bool(existing)
 
 
 def loadPacks(featureService: FeatureService, coroutineRunner: CoroutineRunner, speedMeter: SpeedMeter) -> None:

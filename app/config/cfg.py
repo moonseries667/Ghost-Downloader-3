@@ -5,79 +5,25 @@ import os
 import sys
 from enum import Enum
 from re import compile
-from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 from urllib.request import getproxies
 
 from app.config.serializers import PathSerializer
 from app.config.paths import APP_DATA_DIR, DOWNLOAD_DIR
-
-if TYPE_CHECKING:
-    from PySide6.QtCore import SignalInstance
-    from qfluentwidgets import (
-        BoolValidator,
-        ConfigSerializer,
-        ConfigValidator,
-        EnumSerializer,
-        OptionsValidator,
-        QConfig,
-        RangeValidator,
-        Theme,
-    )
-
-    class ConfigItem[T]:
-        group: str
-        name: str
-        validator: ConfigValidator
-        serializer: ConfigSerializer
-        restart: bool
-        defaultValue: T
-        valueChanged: SignalInstance
-
-        def __init__(
-            self,
-            group: str,
-            name: str,
-            default: T,
-            validator: ConfigValidator | None = None,
-            serializer: ConfigSerializer | None = None,
-            restart: bool = False,
-        ) -> None: ...
-
-        @property
-        def value(self) -> T: ...
-
-        @value.setter
-        def value(self, v: T) -> None: ...
-
-        @property
-        def key(self) -> str: ...
-
-        def serialize(self) -> object: ...
-
-        def deserializeFrom(self, value: object) -> None: ...
-
-    class RangeConfigItem(ConfigItem[int]):
-        @property
-        def range(self) -> tuple[int, int]: ...
-
-    class OptionsConfigItem[T](ConfigItem[T]):
-        @property
-        def options(self) -> list[T]: ...
-else:
-    from qfluentwidgets import (
-        QConfig,
-        ConfigItem,
-        OptionsConfigItem,
-        BoolValidator,
-        OptionsValidator,
-        RangeConfigItem,
-        RangeValidator,
-        ConfigValidator,
-        ConfigSerializer,
-        EnumSerializer,
-        Theme,
-    )
+from app.i18n import N
+from qfluentwidgets import (
+    QConfig,
+    ConfigItem,
+    OptionsConfigItem,
+    BoolValidator,
+    OptionsValidator,
+    RangeConfigItem,
+    RangeValidator,
+    ConfigValidator,
+    ConfigSerializer,
+    EnumSerializer,
+    Theme,
+)
 
 from app.platform.android import IS_ANDROID
 
@@ -91,31 +37,6 @@ BASE_HEADERS = {
     "sec-fetch-user": "?1",
     "upgrade-insecure-requests": "1",
 }
-
-class Language(Enum):
-    CHINESE_SIMPLIFIED = "zh_CN"
-    CHINESE_TRADITIONAL = "zh_TW"
-    CANTONESE = "yue_HK"
-    ENGLISH_UNITED_STATES = "en_US"
-    JAPANESE = "ja_JP"
-    RUSSIAN = "ru_RU"
-    PORTUGUESE_BRAZIL = "pt_BR"
-    SPANISH = "es_ES"
-    AUTO = "Auto"
-
-
-# 语言的展示标签，AUTO 由视图层翻译
-LANGUAGE_TEXTS = {
-    Language.CHINESE_SIMPLIFIED: "简体中文 (中国大陆)",
-    Language.CHINESE_TRADITIONAL: "正體中文 (台灣)",
-    Language.CANTONESE: "粤语 (香港)",
-    Language.ENGLISH_UNITED_STATES: "English (US)",
-    Language.JAPANESE: "日本語 (日本)",
-    Language.RUSSIAN: "Русский (Россия)",
-    Language.PORTUGUESE_BRAZIL: "Português (Brasil)",
-    Language.SPANISH: "Español (España)",
-}
-
 
 class CloseMode(Enum):
     ASK = "Ask"
@@ -184,15 +105,12 @@ class GeometrySerializer(ConfigSerializer):
             return (0, 0, 0, 0)
 
 
-class LanguageSerializer(ConfigSerializer):
-    def serialize(self, language):
-        return language.value
-
-    def deserialize(self, value: str):
-        try:
-            return Language(value)
-        except ValueError:
-            return Language.AUTO
+class LanguageConfigItem(ConfigItem):
+    # 语言列表要等 resources.rcc 注册后才读得到，加载配置时无法校验
+    @property
+    def options(self) -> list[str]:
+        from app.i18n import loadLanguages
+        return ["Auto", *loadLanguages()]
 
 
 class ThemeSerializer(ConfigSerializer):
@@ -207,10 +125,10 @@ class ThemeSerializer(ConfigSerializer):
 
 
 class StringListValidator(ConfigValidator):
-    def validate(self, value: object) -> bool:
+    def validate(self, value) -> bool:
         return isinstance(value, list) and all(isinstance(i, str) for i in value)
 
-    def correct(self, value: object) -> list[str]:
+    def correct(self, value) -> list:
         if not isinstance(value, list):
             return []
         return [i for i in value if isinstance(i, str)]
@@ -300,7 +218,7 @@ class HeadersPresetListValidator(ConfigValidator):
 
     def correct(self, value) -> list:
         presets = [i for i in value if self._isValid(i)] if isinstance(value, list) else []
-        return presets or [{"name": "默认", "headers": dict(BASE_HEADERS)}]
+        return presets or [{"name": N("Presets", "默认"), "headers": dict(BASE_HEADERS)}]
 
 
 class Config(QConfig):
@@ -317,7 +235,7 @@ class Config(QConfig):
         "/storage/emulated/0/Download" if IS_ANDROID else str(DOWNLOAD_DIR),
         serializer=PathSerializer(APP_DATA_DIR),
     )
-    recentFolders: ConfigItem[list[str]] = ConfigItem(
+    recentFolders = ConfigItem(
         "GeneralDownload", "RecentFolders", [], StringListValidator(), PathSerializer(APP_DATA_DIR),
     )
     maxTaskNum = RangeConfigItem("GeneralDownload", "MaxTaskNum", 3, RangeValidator(1, 10))
@@ -382,10 +300,7 @@ class Config(QConfig):
         shouldShowDockIcon = ConfigItem("Personalization", "ShowDockIcon", True, BoolValidator())
         shouldShowDockSpeed = ConfigItem("Personalization", "ShowDockSpeed", True, BoolValidator())
         shouldShowMenuBarSpeed = ConfigItem("Personalization", "ShowMenuBarSpeed", True, BoolValidator())
-    language = OptionsConfigItem(
-        "Personalization", "Language", Language.AUTO,
-        OptionsValidator(Language), LanguageSerializer(), restart=True,
-    )
+    language = LanguageConfigItem("Personalization", "Language", "Auto", restart=True)
 
     # 软件
     shouldCheckUpdateAtStartup = ConfigItem("Software", "CheckUpdateAtStartUp", True, BoolValidator())
@@ -406,7 +321,7 @@ class Config(QConfig):
         "Notice", "TaskPopupPlace", TaskPopupPlace.TASKBAR,
         OptionsValidator(TaskPopupPlace), EnumSerializer(TaskPopupPlace),
     )
-    clipboardIgnoredPacks: ConfigItem[list[str]] = ConfigItem("Software", "ClipboardIgnoredPacks", [], StringListValidator())
+    clipboardIgnoredPacks = ConfigItem("Software", "ClipboardIgnoredPacks", [], StringListValidator())
     geometry = ConfigItem(
         "Software", "Geometry", (0, 0, 0, 0), serializer=GeometrySerializer(),
     )
@@ -415,8 +330,8 @@ class Config(QConfig):
     hasCompletedOobe = ConfigItem("Software", "HasCompletedOobe", False, BoolValidator())
 
     # UI 状态
-    expandedSettingGroups: ConfigItem[list[str]] = ConfigItem("UI", "ExpandedSettingGroups", [], StringListValidator())
-    settingGroupOrder: ConfigItem[list[str]] = ConfigItem("UI", "SettingGroupOrder", [], StringListValidator())
+    expandedSettingGroups = ConfigItem("UI", "ExpandedSettingGroups", [], StringListValidator())
+    settingGroupOrder = ConfigItem("UI", "SettingGroupOrder", [], StringListValidator())
 
     # 网络
     clientProfile = ConfigItem("Network", "ClientProfile", "auto", ClientProfileValidator())
@@ -430,7 +345,7 @@ class Config(QConfig):
     )
     identityPresets = ConfigItem(
         "Network", "IdentityPresets",
-        [{"name": "百度网盘客户端", "clientProfile": "raw",
+        [{"name": N("Presets", "百度网盘客户端"), "clientProfile": "raw",
           "userAgent": "pan.baidu.com", "hosts": ["*.pcs.baidu.com"],
           "isEnabled": True}],
         IdentityPresetListValidator(), JsonConfigSerializer(list, list),
@@ -444,7 +359,7 @@ def currentHeadersPresetIndex() -> int:
     return min(cfg.currentHeadersPreset.value, len(cfg.headersPresets.value) - 1)
 
 
-def currentHeaders() -> dict[str, str]:
+def currentHeaders() -> dict:
     return dict(cfg.headersPresets.value[currentHeadersPresetIndex()]["headers"])
 
 

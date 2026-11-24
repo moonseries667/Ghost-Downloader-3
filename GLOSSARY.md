@@ -261,6 +261,7 @@ _Avoid_: 用绑定端口或任务句柄推断是否在监听
 
 **Category**:
 下载分类和目标目录规则。将文件扩展名匹配到分类并解析下载目录。
+任务未指定分类时按扩展名自动匹配；未分类指用户明确不分类，或自动匹配不到任何分类。
 _Avoid_: group、tag、type
 
 **Coroutine Runner**:
@@ -368,6 +369,14 @@ _Avoid_: 发版、打包、release（指 App）
 下载连接经过的代理服务器。三种模式：不使用、自动检测系统代理、自定义。
 用户最近一次填写的自定义地址独立保存，切换到其他模式再切回时仍在。
 _Avoid_: 与 Proxy Site 混淆
+
+**Headers Preset**:
+可复用的默认 HTTP 请求头集合。当前选中的一份在新建 Task 时作为初始请求头拷贝进 Task；修改或删除预设不影响已有 Task。
+_Avoid_: 默认请求头、header template
+
+**Identity Preset**:
+按域名通配规则为请求匹配客户端指纹与 User-Agent 的预设。启用时按主机名自动生效，也可在 Task 选项中显式指定。
+_Avoid_: Identity Rule、client preset、UA 规则
 
 ### GitHub 加速
 

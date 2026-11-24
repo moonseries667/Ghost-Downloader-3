@@ -149,6 +149,9 @@ jobs:
 
   build-windows:
     needs: [prepare]
+    permissions:
+      actions: read
+      contents: write
     if: ${{ github.event.inputs.build_target == 'windows' || github.event.inputs.build_target == 'all' }}
     strategy:
       fail-fast: false
@@ -257,7 +260,7 @@ jobs:
 
       - name: Sign binaries
         if: ${{ github.event.inputs.sign_artifact == 'true' }}
-        uses: signpath/github-action-submit-signing-request@v2
+        uses: signpath/github-action-submit-signing-request@v3
         with:
           api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
           organization-id: '${{ secrets.SIGNPATH_ORGANIZATION_ID }}'
@@ -270,18 +273,7 @@ jobs:
 
       - name: Download Inno Setup Translation Files
         if: ${{ github.event.inputs.create_release == 'true' || github.event.inputs.package_installer == 'true' }}
-        run: |
-          $langs = @(
-            "ChineseSimplified",
-            "ChineseTraditional",
-            "Japanese",
-            "Russian",
-            "Spanish",
-            "BrazilianPortuguese"
-          )
-          foreach ($lang in $langs) {
-            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/${lang}.isl" -OutFile "C:\Program Files (x86)\Inno Setup 6\Languages\${lang}.isl"
-          }
+        run: uv run --no-sync python scripts/fetch_installer_languages.py
 
       - name: Build Installer
         if: ${{ github.event.inputs.create_release == 'true' || github.event.inputs.package_installer == 'true' }}
@@ -299,7 +291,7 @@ jobs:
 
       - name: Sign installer
         if: ${{ github.event.inputs.sign_artifact == 'true' && (github.event.inputs.create_release == 'true' || github.event.inputs.package_installer == 'true') }}
-        uses: signpath/github-action-submit-signing-request@v2
+        uses: signpath/github-action-submit-signing-request@v3
         with:
           api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
           organization-id: '${{ secrets.SIGNPATH_ORGANIZATION_ID }}'
@@ -631,12 +623,12 @@ jobs:
         include:
           - architecture: x86_64
             runner: ubuntu-22.04
-            deb_arch: amd64
             appimage_arch: x86_64
+            hdiff_arch: linux64
           - architecture: arm64
             runner: ubuntu-24.04-arm
-            deb_arch: arm64
             appimage_arch: aarch64
+            hdiff_arch: linux_arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
@@ -650,9 +642,50 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y desktop-file-utils libegl1-mesa-dev libzstd1
+          sudo apt-get install -y cmake desktop-file-utils libegl1-mesa-dev libzstd1
           uv python install 3.13
           uv sync
+
+      - name: Resolve fcitx5-qt plugin cache key
+        id: fcitx5_meta
+        run: |
+          PYSIDE6_VERSION=$(uv run --no-sync python -c "import PySide6; print(PySide6.__version__)")
+          FCITX5_QT_TAG=$(uv run --no-sync scripts/build_fcitx5_plugin.py --print-tag)
+          echo "pyside6_version=$PYSIDE6_VERSION" >> "$GITHUB_OUTPUT"
+          echo "fcitx5_qt_tag=$FCITX5_QT_TAG" >> "$GITHUB_OUTPUT"
+          echo "PySide6=$PYSIDE6_VERSION fcitx5-qt=$FCITX5_QT_TAG"
+
+      - name: Cache fcitx5-qt plugin
+        id: fcitx5_cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/fcitx5-qt-plugin
+          key: fcitx5-qt-plugin-${{ matrix.architecture }}-${{ steps.fcitx5_meta.outputs.pyside6_version }}-${{ steps.fcitx5_meta.outputs.fcitx5_qt_tag }}
+
+      - name: Build fcitx5-qt plugin
+        if: ${{ steps.fcitx5_cache.outputs.cache-hit != 'true' }}
+        run: |
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            pkg-config \
+            extra-cmake-modules \
+            libxkbcommon-dev \
+            libxcb1-dev \
+            libx11-dev \
+            libwayland-dev \
+            libgl-dev \
+            patchelf
+          uv run --no-sync scripts/build_fcitx5_plugin.py \
+            --qt-version "${{ steps.fcitx5_meta.outputs.pyside6_version }}" \
+            --arch "${{ matrix.architecture }}" \
+            --tag "${{ steps.fcitx5_meta.outputs.fcitx5_qt_tag }}" \
+            --output-dir ~/.cache/fcitx5-qt-plugin
+
+      - name: Install fcitx5-qt plugin into PySide6
+        run: |
+          PLUGIN_DIR=$(uv run --no-sync python -c "import PySide6, pathlib; print(pathlib.Path(PySide6.__file__).parent / 'Qt/plugins/platforminputcontexts')")
+          cp ~/.cache/fcitx5-qt-plugin/libfcitx5platforminputcontextplugin.so "$PLUGIN_DIR/"
 
       - name: Build with Nuitka
         run: |
@@ -660,73 +693,66 @@ jobs:
           uv run scripts/deploy.py
           chmod +x "dist/Ghost-Downloader-3.dist/Ghost-Downloader-3.bin"
 
-      - name: Build .deb and .AppImage
+      - name: Verify Linux input method plugins
+        run: |
+          IM_DIR="dist/Ghost-Downloader-3.dist/PySide6/qt-plugins/platforminputcontexts"
+          test -f "$IM_DIR/libfcitx5platforminputcontextplugin.so"
+          test -f "$IM_DIR/libibusplatforminputcontextplugin.so"
+          test -f "$IM_DIR/libcomposeplatforminputcontextplugin.so"
+          test ! -f "$IM_DIR/libqtvirtualkeyboardplugin.so"
+          for plugin in "$IM_DIR"/*.so; do
+            echo "Checking $plugin"
+            LDD_OUT=$(ldd "$plugin")
+            echo "$LDD_OUT"
+            if grep -q "not found" <<< "$LDD_OUT"; then
+              echo "::error::Missing shared library dependency in $plugin"
+              exit 1
+            fi
+          done
+
+      - name: Build .AppImage
         run: |
           DIST_DIR="dist/Ghost-Downloader-3.dist"
-          DEB_ROOT="$RUNNER_TEMP/deb-root"
           APPDIR="$RUNNER_TEMP/GhostDownloader.AppDir"
           PACKAGE_NAME="ghost-downloader"
-          INSTALL_DIR="/opt/Ghost-Downloader-3"
           DESKTOP_FILE="com.xychr.ghostdownloader.desktop"
           ICON_FILE="$PACKAGE_NAME.png"
-          DEB_FILE="dist/Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.deb"
           APPIMAGE_FILE="dist/Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.AppImage"
           APPIMAGETOOL_FILE="appimagetool-${{ matrix.appimage_arch }}.AppImage"
           APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/latest/download/${APPIMAGETOOL_FILE}"
 
-          rm -rf "$DEB_ROOT" "$APPDIR" "$RUNNER_TEMP/squashfs-root"
+          rm -rf "$APPDIR" "$RUNNER_TEMP/squashfs-root"
           mkdir -p \
-            "$DEB_ROOT/DEBIAN" \
-            "$DEB_ROOT$INSTALL_DIR" \
-            "$DEB_ROOT/usr/bin" \
-            "$DEB_ROOT/usr/share/applications" \
-            "$DEB_ROOT/usr/share/icons/hicolor/256x256/apps" \
             "$APPDIR/usr/bin" \
             "$APPDIR/usr/lib/$PACKAGE_NAME" \
             "$APPDIR/usr/share/applications" \
             "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 
-          cp -R "$DIST_DIR"/. "$DEB_ROOT$INSTALL_DIR/"
           cp -R "$DIST_DIR"/. "$APPDIR/usr/lib/$PACKAGE_NAME/"
           cp /usr/lib/*/libzstd.so.1 "$APPDIR/usr/lib/$PACKAGE_NAME/"
 
-          ln -s "$INSTALL_DIR/Ghost-Downloader-3.bin" "$DEB_ROOT/usr/bin/$PACKAGE_NAME"
           ln -s "../lib/$PACKAGE_NAME/Ghost-Downloader-3.bin" "$APPDIR/usr/bin/$PACKAGE_NAME"
           ln -s "usr/bin/$PACKAGE_NAME" "$APPDIR/AppRun"
 
-          cat > "$DEB_ROOT/DEBIAN/control" <<EOF
-          Package: $PACKAGE_NAME
-          Version: ${{ env.VERSION }}
-          Section: net
-          Priority: optional
-          Architecture: ${{ matrix.deb_arch }}
-          Maintainer: XiaoYouChR <XiaoYouChR@qq.com>
-          Description: Ghost Downloader
-           A multi-threading downloader based on PySide6.
-          EOF
-
-          cat > "$DEB_ROOT/usr/share/applications/$DESKTOP_FILE" <<EOF
+          cat > "$APPDIR/usr/share/applications/$DESKTOP_FILE" <<EOF
           [Desktop Entry]
           Type=Application
           Name=Ghost Downloader
-          Comment=A multi-threading downloader based on PySide6
-          Exec=$PACKAGE_NAME
+          Comment=The only downloader you need
+          Exec=$PACKAGE_NAME %U
           Icon=$PACKAGE_NAME
           Terminal=false
           Categories=Network;Utility;
           StartupNotify=false
           EOF
 
-          cp "$DEB_ROOT/usr/share/applications/$DESKTOP_FILE" "$APPDIR/usr/share/applications/$DESKTOP_FILE"
-          cp "app/assets/logo.png" "$DEB_ROOT/usr/share/icons/hicolor/256x256/apps/$ICON_FILE"
           cp "app/assets/logo.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/$ICON_FILE"
 
           ln -s "usr/share/applications/$DESKTOP_FILE" "$APPDIR/$DESKTOP_FILE"
           ln -s "usr/share/icons/hicolor/256x256/apps/$ICON_FILE" "$APPDIR/$ICON_FILE"
           ln -s "usr/share/icons/hicolor/256x256/apps/$ICON_FILE" "$APPDIR/.DirIcon"
 
-          desktop-file-validate "$DEB_ROOT/usr/share/applications/$DESKTOP_FILE"
-          dpkg-deb --build --root-owner-group "$DEB_ROOT" "$DEB_FILE"
+          desktop-file-validate "$APPDIR/usr/share/applications/$DESKTOP_FILE"
 
           curl -fL "$APPIMAGETOOL_URL" -o "$RUNNER_TEMP/$APPIMAGETOOL_FILE"
           chmod +x "$RUNNER_TEMP/$APPIMAGETOOL_FILE"
@@ -741,30 +767,61 @@ jobs:
           )
           chmod +x "$APPIMAGE_FILE"
 
-          dpkg-deb --info "$DEB_FILE"
           file "$APPIMAGE_FILE"
+
+      - name: Build updater
+        run: |
+          cmake -B build-updater -DCMAKE_BUILD_TYPE=Release tools/updater
+          cmake --build build-updater
+          cp build-updater/updater dist/Ghost-Downloader-3.dist/
+
+      - name: Download HDiffPatch
+        run: |
+          curl -fsSL "https://github.com/sisong/HDiffPatch/releases/download/v5.1.3/hdiffpatch_v5.1.3_bin_${{ matrix.hdiff_arch }}.zip" -o hdiffpatch.zip
+          python3 -m zipfile -e hdiffpatch.zip hdiffpatch
+          chmod +x "hdiffpatch/${{ matrix.hdiff_arch }}/hdiffz" "hdiffpatch/${{ matrix.hdiff_arch }}/hpatchz"
+          cp "hdiffpatch/${{ matrix.hdiff_arch }}/hpatchz" dist/Ghost-Downloader-3.dist/
 
       - name: Tar the contents of Ghost-Downloader
         if: ${{ github.event.inputs.create_release == 'true' }}
-        shell: pwsh
         run: |
-          $distPath = "dist/Ghost-Downloader-3.dist"
-          $tarFile = "Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.tar.xz"
+          cp app/assets/logo.png dist/Ghost-Downloader-3.dist/logo.png
+          TAR_FILE="Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.tar.xz"
+          echo "Creating tar.xz archive of dist/Ghost-Downloader-3.dist..."
+          tar -cJf "$TAR_FILE" -C dist/Ghost-Downloader-3.dist .
+          echo "Archive created at $TAR_FILE"
 
-          Write-Output "Creating tar.xz archive of $distPath..."
-          tar -cJf $tarFile -C $distPath .
-          Write-Output "Archive created at $tarFile"
+      - name: Generate patch
+        if: ${{ needs.prepare.outputs.patch_base != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BASE_VER="${{ needs.prepare.outputs.patch_base }}"
+          BASE_TAR="Ghost-Downloader-v${BASE_VER}-Linux-${{ matrix.architecture }}.tar.xz"
+          if ! gh release view "v$BASE_VER" --json assets --jq '.assets[].name' | grep -Fxq "$BASE_TAR"; then
+            echo "v$BASE_VER has no Linux-${{ matrix.architecture }} package, skipping patch"
+            exit 0
+          fi
+
+          mkdir -p prev-download prev-dir
+          gh release download "v$BASE_VER" -p "$BASE_TAR" -D prev-download/
+          tar -xJf "prev-download/$BASE_TAR" -C prev-dir
+          PATCH_FILE="patch-Linux-${{ matrix.architecture }}-${BASE_VER}-to-${{ env.VERSION }}.hdiff"
+          "hdiffpatch/${{ matrix.hdiff_arch }}/hdiffz" -f prev-dir dist/Ghost-Downloader-3.dist "$PATCH_FILE"
+          rm -rf prev-download prev-dir
+          echo "PATCH_FILE=$PATCH_FILE" >> "$GITHUB_ENV"
 
       - name: Upload to release
         if: ${{ github.event.inputs.create_release == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "v${{ env.VERSION }}" \
-            "Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.tar.xz" \
-            "dist/Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.deb" \
-            "dist/Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.AppImage" \
-            --clobber
+          FILES=(
+            "Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.tar.xz"
+            "dist/Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.AppImage"
+          )
+          if [ -n "${PATCH_FILE:-}" ] && [ -f "$PATCH_FILE" ]; then FILES+=("$PATCH_FILE"); fi
+          gh release upload "v${{ env.VERSION }}" "${FILES[@]}" --clobber
 
       - name: Upload artifacts
         if: ${{ github.event.inputs.create_release == 'false' }}
@@ -773,7 +830,6 @@ jobs:
           name: Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}
           path: |
             dist/Ghost-Downloader-3.dist
-            dist/Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.deb
             dist/Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.AppImage
 
   android-libtorrent:
@@ -1005,7 +1061,7 @@ jobs:
 
   finalize:
     needs: [prepare, build-windows, build-macos, build-ubuntu, build-android]
-    if: ${{ always() && github.event.inputs.create_release == 'true' && needs.build-windows.result == 'success' && needs.build-macos.result == 'success' }}
+    if: ${{ always() && github.event.inputs.create_release == 'true' && needs.prepare.result == 'success' && !contains(fromJSON('["failure","cancelled"]'), needs.build-windows.result) && !contains(fromJSON('["failure","cancelled"]'), needs.build-macos.result) && !contains(fromJSON('["failure","cancelled"]'), needs.build-ubuntu.result) && (needs.build-windows.result == 'success' || needs.build-macos.result == 'success' || needs.build-ubuntu.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -1028,7 +1084,7 @@ jobs:
           PREV_VER: ${{ needs.prepare.outputs.patch_base }}
         run: |
           mkdir -p assets
-          gh release download "v${VERSION}" --repo ${{ github.repository }} -p "*.hdiff" -p "*.zip" -p "*.dmg" -p "*.tar.xz" -p "*.deb" -p "*.AppImage" -p "*.apk" -p "*.exe" -D assets/ 2>/dev/null || true
+          gh release download "v${VERSION}" --repo ${{ github.repository }} -p "*.hdiff" -p "*.zip" -p "*.dmg" -p "*.tar.xz" -p "*.AppImage" -p "*.apk" -p "*.exe" -D assets/ 2>/dev/null || true
 
           uv run --no-project python3 << 'PYEOF'
           import hashlib, json, os
@@ -1044,7 +1100,12 @@ jobs:
                       h.update(chunk)
               return h.hexdigest()
 
-          platforms = ["Windows-x86_64", "Windows-arm64", "macOS-arm64", "macOS-x86_64"]
+          platforms = [
+              "Windows-x86_64", "Windows-arm64",
+              "macOS-arm64", "macOS-x86_64",
+              "Linux-x86_64", "Linux-arm64",
+          ]
+          full_ext = {"Windows": ".zip", "macOS": ".dmg", "Linux": ".tar.xz"}
           patches = {}
           full = {}
 
@@ -1052,10 +1113,12 @@ jobs:
               for f in os.listdir(assets_dir):
                   if f.startswith(f"patch-{p}-") and f.endswith(".hdiff"):
                       path = os.path.join(assets_dir, f)
-                      patches[p] = {"from": prev_ver, "file": f, "sha256": sha256of(path), "size": os.path.getsize(path)}
+                      prefix, suffix = f"patch-{p}-", f"-to-{version}.hdiff"
+                      from_ver = f[len(prefix):-len(suffix)] if f.endswith(suffix) else prev_ver
+                      patches[p] = {"from": from_ver, "file": f, "sha256": sha256of(path), "size": os.path.getsize(path)}
                       break
 
-              ext = ".zip" if p.startswith("Windows") else ".dmg"
+              ext = full_ext[p.split("-", 1)[0]]
               full_name = f"Ghost-Downloader-v{version}-{p}{ext}"
               full_path = os.path.join(assets_dir, full_name)
               if os.path.isfile(full_path):

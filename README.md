@@ -13,7 +13,8 @@ Swiftproxy provides 90M+ real residential IPs across 220+ locations worldwide, h
 
 ![Banner](.github/assets/banner.webp)
 
-<a href="https://trendshift.io/repositories/13847" target="_blank"><img src="https://trendshift.io/api/badge/repositories/13847" alt="XiaoYouChR%2FGhost-Downloader-3 | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+<a href="https://trendshift.io/repositories/13847?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-13847" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/13847/daily?language=Python" alt="XiaoYouChR%2FGhost-Downloader-3 | Trendshift" width="250" height="55"/></a>
+<a href="https://trendshift.io/repositories/13847?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-13847" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/13847" alt="XiaoYouChR%2FGhost-Downloader-3 | Trendshift" width="250" height="55"/></a>
 
 ## The only downloader you need
 
@@ -80,6 +81,14 @@ https://github.com/user-attachments/assets/d97dc8c9-f320-4645-8dcd-0d9dc4cf2eab
 </p>
 
 <!-- COMMAND LINE -->
+## Translation
+
+We translate Ghost Downloader on [Crowdin](https://gdi18n.xychr.com). Do not send pull requests that change translation files.
+
+- Your language is not on Crowdin? Request it in [Discussions](https://github.com/XiaoYouChR/Ghost-Downloader-3/discussions/categories/翻译-translations).
+- The source text is Simplified Chinese. [@i0ntempest](https://github.com/i0ntempest) reviews the English translation by hand. To see it, open the **Other Languages** panel in the Crowdin editor.
+- A new language goes into the app when 60% of the desktop text is translated. Text that is not translated shows in English.
+
 ## Command Line
 
 Install `ghd` from **Settings -> Command Line Tool**.
@@ -139,26 +148,50 @@ Thanks to all contributors who have participated in this project!
 
 ## Translation Contributors
 
-> [!TIP]
-> If you'd like to help translate Ghost Downloader, welcome to join the Crowdin project: [ghost-downloader](https://crowdin.com/project/ghost-downloader)
-
 <!-- CROWDIN-CONTRIBUTORS-START -->
 <table>
   <tbody>
     <tr>
       <td align="center" valign="top">
-        <a href="https://crowdin.com/profile/XiaoYouChR"><img alt="logo" style="width: 64px" src="https://crowdin-static.cf-downloads.crowdin.com/avatar/17224586/medium/44dde418af0da7d664fff23b96622e40.png" />
+        <a href="https://crowdin.com/profile/XiaoYouChR"><img alt="logo" style="width: 64px" src="https://crowdin-static.cf-downloads.crowdin.com/avatar/17224586/medium/8543b6654f23235a06e06daaede0dea7.jpg" />
           <br />
           <sub><b>XiaoYouChR</b></sub></a>
         <br />
-        <sub><b>14249 words</b></sub>
+        <sub><b>323770 words</b></sub>
+      </td>
+      <td align="center" valign="top">
+        <a href="https://crowdin.com/profile/hzzmonet"><img alt="logo" style="width: 64px" src="https://crowdin-static.cf-downloads.crowdin.com/avatar/17541058/medium/6d2519b5176d5dc224526a18f945002e.jpeg" />
+          <br />
+          <sub><b>Nguyễn Anh Kiệt</b></sub>
+          <br />
+          <sub><b>(hzzmonet)</b></sub></a>
+        <br />
+        <sub><b>15061 words</b></sub>
+      </td>
+      <td align="center" valign="top">
+        <a href="https://crowdin.com/profile/oocr"><img alt="logo" style="width: 64px" src="https://crowdin-static.cf-downloads.crowdin.com/avatar/18002969/medium/8dc2d6ceade5dc57fd4fccc62d874db0.jpeg" />
+          <br />
+          <sub><b>CHEONG-KYUN</b></sub>
+          <br />
+          <sub><b>(oocr)</b></sub></a>
+        <br />
+        <sub><b>6913 words</b></sub>
+      </td>
+      <td align="center" valign="top">
+        <a href="https://crowdin.com/profile/Havokdan"><img alt="logo" style="width: 64px" src="https://crowdin-static.cf-downloads.crowdin.com/avatar/12607851/medium/a1ec7e6a771c303892d82c92015a3641_default.png" />
+          <br />
+          <sub><b>Daniel Neves</b></sub>
+          <br />
+          <sub><b>(Havokdan)</b></sub></a>
+        <br />
+        <sub><b>4481 words</b></sub>
       </td>
       <td align="center" valign="top">
         <a href="https://crowdin.com/profile/i0ntempest"><img alt="logo" style="width: 64px" src="https://crowdin-static.cf-downloads.crowdin.com/avatar/17636930/medium/f6bf4e67c7b87221f2e7e04345f8c6b2.jpeg" />
           <br />
           <sub><b>i0ntempest</b></sub></a>
         <br />
-        <sub><b>1988 words</b></sub>
+        <sub><b>2155 words</b></sub>
       </td>
       <td align="center" valign="top">
         <a href="https://crowdin.com/profile/ReM2812"><img alt="logo" style="width: 64px" src="https://crowdin-static.cf-downloads.crowdin.com/avatar/17626502/medium/8d12a395a224c0f9d5546a8e5621186c.jpg" />
@@ -166,6 +199,35 @@ Thanks to all contributors who have participated in this project!
           <sub><b>ReM2812</b></sub></a>
         <br />
         <sub><b>1010 words</b></sub>
+      </td>
+      <td align="center" valign="top">
+        <a href="https://crowdin.com/profile/s0990"><img alt="logo" style="width: 64px" src="https://crowdin-static.cf-downloads.crowdin.com/avatar/14938059/medium/c8029e289a5b05e7d8a92c07163323d8.png" />
+          <br />
+          <sub><b>Kay Xue學昀楷</b></sub>
+          <br />
+          <sub><b>(s0990)</b></sub></a>
+        <br />
+        <sub><b>602 words</b></sub>
+      </td>
+      <td align="center" valign="top">
+        <a href="https://crowdin.com/profile/mediaket"><img alt="logo" style="width: 64px" src="https://crowdin-static.cf-downloads.crowdin.com/avatar/13669331/medium/ebf8aaccc9d72ed7690ac8aa7e116d8e.jpg" />
+          <br />
+          <sub><b>R. KETFI</b></sub>
+          <br />
+          <sub><b>(mediaket)</b></sub></a>
+        <br />
+        <sub><b>245 words</b></sub>
+      </td>
+    </tr>
+    <tr>
+      <td align="center" valign="top">
+        <a href="https://crowdin.com/profile/ryuuDre"><img alt="logo" style="width: 64px" src="https://crowdin-static.cf-downloads.crowdin.com/avatar/18000817/medium/27dc57e2949e8cebf51ef86794abc1f3.png" />
+          <br />
+          <sub><b>Ryuu</b></sub>
+          <br />
+          <sub><b>(ryuuDre)</b></sub></a>
+        <br />
+        <sub><b>179 words</b></sub>
       </td>
       <td align="center" valign="top">
         <a href="https://crowdin.com/profile/Dima88888"><img alt="logo" style="width: 64px" src="https://crowdin-static.cf-downloads.crowdin.com/avatar/16304162/medium/706302f8224fffaf9d81f8cc4168ed24_default.png" />

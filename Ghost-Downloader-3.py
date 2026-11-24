@@ -9,16 +9,14 @@ from typing import TYPE_CHECKING
 from app.config.paths import APP_DATA_DIR
 
 if TYPE_CHECKING:
-    from types import TracebackType
     from desktop_notifier.common import Notification
-    from app.models.task import Task, TaskError, TaskOptions
+    from app.models.task import Task
     from app.platform.application import Application
     from app.platform.instance import PrimaryInstance
     from app.services.browser_service import PairRequest
-    from app.services.update_service import UpdateInfo
 
 
-def _exceptionHook(exceptionType: type[BaseException], value: BaseException, tb: TracebackType | None) -> None:
+def _exceptionHook(exceptionType, value, tb):
     from loguru import logger
     info = (exceptionType, value, tb)
     logger.opt(exception=info).error("Unhandled application exception")
@@ -40,10 +38,8 @@ def setupEnvironment() -> None:
         setupHiddenSubprocess()
 
     from app.view.qfw_patch import (
-        patchLinuxFrameless, patchMaskDialogAnimation, patchStackedWidgetAnimation, patchWindowsFrameless,
+        patchLinuxFrameless, patchMaskDialogAnimation, patchWindowsFrameless,
     )
-    from app.view.components.labels import IconBodyLabel
-    patchStackedWidgetAnimation()
     # Wayland 上在绘制中截图会递归重绘，卡住合成器 #1017
     if sys.platform != "linux":
         patchMaskDialogAnimation()
@@ -51,7 +47,6 @@ def setupEnvironment() -> None:
         patchLinuxFrameless()
     if sys.platform == "win32":
         patchWindowsFrameless()
-    qconfig.themeChanged.connect(IconBodyLabel.clearCache)
     qconfig.load(f"{APP_DATA_DIR}/UserConfig.json", cfg)
 
     if cfg.dpiScale.value != 0:
@@ -76,10 +71,9 @@ def startApp(application: Application, primaryInstance: PrimaryInstance, isSilen
     from app.signal_bus import signalBus
     from app.services.port_listener import ListenStatus
     from app.services.update_service import UpdateService
-    from app.startup import loadResources, setupThemeColor, createEngine, deleteBackupDir, deleteLegacyAppIdFiles, loadPacks, checkUpdateAtStartup
-    from app.view.windows.main_window import MainWindow
+    from app.startup import loadResources, setupThemeColor, createEngine, deleteBackupDir, loadPacks, checkUpdateAtStartup
 
-    def exceptionHook(exceptionType: type[BaseException], value: BaseException, tb: TracebackType | None) -> None:
+    def exceptionHook(exceptionType, value, tb):
         _exceptionHook(exceptionType, value, tb)
         message = "".join(traceback.format_exception(exceptionType, value, tb)).rstrip()
         signalBus.exceptionCaught.emit(message)
@@ -88,7 +82,7 @@ def startApp(application: Application, primaryInstance: PrimaryInstance, isSilen
 
     from PySide6.QtCore import QLocale
     from app.platform.desktop import buildFontFamilies
-    localeName = cfg.language.value.value
+    localeName = cfg.language.value
     locale = QLocale() if localeName == "Auto" else QLocale(localeName)
     cfg.set(cfg.fontFamilies, buildFontFamilies(locale, application.font().defaultFamily()), save=False)
     application.setQuitOnLastWindowClosed(False)
@@ -106,19 +100,9 @@ def startApp(application: Application, primaryInstance: PrimaryInstance, isSilen
     coroutineRunner, taskService, featureService = engine.coroutineRunner, engine.taskService, engine.featureService
     browserService, speedMeter = engine.browserService, engine.speedMeter
 
-    deleteBackupDir()
-    if deleteLegacyAppIdFiles():
-        from app.platform.file_association import registerUrlScheme
-        from app.platform.run_at_login import setRunAtLogin
-        if cfg.isUrlSchemeRegistered.value:
-            registerUrlScheme()
-        if cfg.shouldRunAtLogin.value:
-            setRunAtLogin(True)
-
     setupThemeColor(application)
 
     updateService = UpdateService(coroutineRunner)
-    loadPacks(featureService, coroutineRunner, speedMeter)
 
     from app.services.plan import Plan
     plan = Plan(allCompleted=lambda: taskService.runningCount() == 0)
@@ -134,17 +118,18 @@ def startApp(application: Application, primaryInstance: PrimaryInstance, isSilen
 
     window: MainWindow | None = None
 
-    def emptyWorkingSetIfIdle() -> None:
+    def emptyWorkingSetIfIdle():
         if window is None and taskService.runningCount() == 0:
             emptyWorkingSet()
 
-    def onWindowDestroyed() -> None:
+    def onWindowDestroyed():
         nonlocal window
         window = None
         emptyWorkingSetIfIdle()
 
     def createWindow() -> MainWindow:
         nonlocal window
+        from app.view.windows.main_window import MainWindow
         window = MainWindow(taskService, featureService, browserService, engine.browserListener, engine.aria2RpcListener, engine.categoryService, speedMeter, coroutineRunner, plan, updateService)
         window.destroyed.connect(onWindowDestroyed)
         return window
@@ -157,12 +142,12 @@ def startApp(application: Application, primaryInstance: PrimaryInstance, isSilen
         raiseWindow(window)
         return window
 
-    def onTaskDraftRequested(tasks: list[TaskOptions], error: TaskError | None) -> None:
+    def onTaskDraftRequested(tasks, error):
         if window is None:
             createWindow().setupPacks()
         window.addTasks(tasks, error)
 
-    def onExtensionUpdated(version: str) -> None:
+    def onExtensionUpdated(version):
         from qfluentwidgets import InfoBar, InfoBarPosition
         w = show()
         InfoBar.success(w.tr("浏览器扩展已更新"), f"v{version}",
@@ -179,10 +164,12 @@ def startApp(application: Application, primaryInstance: PrimaryInstance, isSilen
         from PySide6.QtCore import QEventLoop
         from app.view.windows.oobe_window import OobeWindow
 
+        loadPacks(featureService, coroutineRunner, speedMeter)
         engine.start()
+        deleteBackupDir()
 
         oobe = OobeWindow(browserService, engine.browserListener, coroutineRunner, featureService, engine.runtimeStatusService)
-        def onOobePairRequestChanged(request: PairRequest | None) -> None:
+        def onOobePairRequestChanged(request):
             if request is not None:
                 oobe.onPairRequested(request)
 
@@ -200,21 +187,33 @@ def startApp(application: Application, primaryInstance: PrimaryInstance, isSilen
         oobe.deleteLater()
 
         show()
+    elif isSilent:
+        loadPacks(featureService, coroutineRunner, speedMeter)
+        engine.start()
+        deleteBackupDir()
+    elif sys.platform == "darwin":
+        loadPacks(featureService, coroutineRunner, speedMeter)
+        createWindow().setupPacks()
+        engine.start()
+        deleteBackupDir()
     else:
+        from qfluentwidgets import SplashScreen
         createWindow()
+        splash = SplashScreen(window.windowIcon(), window, enableShadow=False)
+        splash.raise_()
+        window.show()
+        application.processEvents()
 
-        if not isSilent and sys.platform != "darwin":
-            from qfluentwidgets import SplashScreen
-            splash = SplashScreen(window.windowIcon(), window, enableShadow=False)
-            splash.raise_()
-            window.show()
-            application.processEvents()
-
+        loadPacks(featureService, coroutineRunner, speedMeter)
         window.setupPacks()
         engine.start()
+        deleteBackupDir()
 
-        if not isSilent and sys.platform != "darwin":
-            splash.finish()
+        splash.finish()
+
+    from qfluentwidgets import qconfig
+    from app.view.components.labels import IconBodyLabel
+    qconfig.themeChanged.connect(IconBodyLabel.clearCache)
 
     if sys.platform != "darwin":
         signalBus.activationRequested.connect(show)
@@ -363,7 +362,7 @@ def startApp(application: Application, primaryInstance: PrimaryInstance, isSilen
         signalBus.activationRequested.connect(show)
 
     from app.services.update_service import UpdateState
-    def onUpdateChanged(info: UpdateInfo) -> None:
+    def onUpdateChanged(info):
         if info.targetId == "app" and info.state == UpdateState.AVAILABLE:
             show().onUpdateAvailable(info)
         elif info.targetId != "app" and info.state == UpdateState.AVAILABLE:
@@ -381,7 +380,7 @@ def startApp(application: Application, primaryInstance: PrimaryInstance, isSilen
     updateService.changed.connect(onUpdateChanged)
     checkUpdateAtStartup(updateService)
 
-    def onAboutToQuit() -> None:
+    def onAboutToQuit():
         engine.stop()
         updateService.apply()
         coroutineRunner.stop()

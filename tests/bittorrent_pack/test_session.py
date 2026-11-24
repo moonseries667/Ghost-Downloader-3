@@ -1,11 +1,30 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import socket
+from pathlib import Path
+
+from aiohttp import web
 import libtorrent as lt
 import pytest
 
 from app.config.cfg import cfg
 from features.bittorrent_pack.config import bittorrentConfig
-from features.bittorrent_pack.session import BTSession, buildSettings
+from features.bittorrent_pack.session import BTSession, SessionState, TorrentParams, buildSettings
+
+
+def buildParams(tmpPath: Path) -> TorrentParams:
+    payload = b"hello world"
+    torrentData = lt.bencode({
+        b"info": {
+            b"name": b"sample.bin",
+            b"length": len(payload),
+            b"piece length": 16384,
+            b"pieces": hashlib.sha1(payload).digest(),
+        },
+    })
+    return TorrentParams(torrentData=torrentData, savePath=str(tmpPath))
 
 
 @pytest.fixture()
@@ -67,9 +86,21 @@ def test_build_encryption_mode(monkeypatch, mode, policy, level, preferRc4):
     ) == (policy, policy, level, preferRc4)
 
 
-async def test_set_config_updates_open_session(config):
+async def startRun(session: BTSession, taskId: str, params: TorrentParams) -> asyncio.Task:
+    task = asyncio.create_task(session.run(taskId, params))
+    await asyncio.sleep(0)
+    return task
+
+
+async def cancelRun(task: asyncio.Task) -> None:
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_set_config_updates_open_session(config, tmp_path):
     session = BTSession()
-    session.open()
+    running = await startRun(session, "t1", buildParams(tmp_path))
     try:
         cfg.set(bittorrentConfig.enableUtp, False)
         cfg.set(bittorrentConfig.encryptionMode, "forced")
@@ -77,4 +108,188 @@ async def test_set_config_updates_open_session(config):
 
         assert await session.probeDhtNodes() is None
     finally:
+        await cancelRun(running)
         await session.close()
+
+
+async def test_stop_closes_idle_session_only(config, tmp_path):
+    states: list[SessionState] = []
+    session = BTSession()
+    session.setPost(lambda fn: fn())
+    assert session.state == SessionState.STOPPED
+    session.stateChanged.connect(lambda: states.append(session.state))
+
+    running = await startRun(session, "t1", buildParams(tmp_path))
+    try:
+        await session.stop()
+        assert session.state == SessionState.BUSY
+        assert not running.done()
+
+        await cancelRun(running)
+        assert session.state == SessionState.IDLE
+
+        await session.stop()
+        assert session.state == SessionState.STOPPED
+        assert states == [SessionState.BUSY, SessionState.IDLE, SessionState.STOPPED]
+    finally:
+        await session.close()
+
+
+async def test_cancel_run_closes_session_after_idle(config, tmp_path):
+    stopped = asyncio.Event()
+    session = BTSession(idleTimeout=0.05)
+    session.stateChanged.connect(lambda: session.state == SessionState.STOPPED and stopped.set())
+    params = buildParams(tmp_path)
+
+    try:
+        await cancelRun(await startRun(session, "t1", params))
+        assert session.state == SessionState.IDLE
+
+        second = await startRun(session, "t2", params)
+        await asyncio.sleep(0.08)
+        assert session.state == SessionState.BUSY
+        assert not stopped.is_set()
+
+        await cancelRun(second)
+        async with asyncio.timeout(1):
+            await stopped.wait()
+        assert session.state == SessionState.STOPPED
+    finally:
+        await session.close()
+
+
+def buildMultiFileTorrent(tmpPath: Path, files: dict[str, bytes]) -> tuple[bytes, dict[str, int]]:
+    sourceRoot = tmpPath / "source"
+    torrentDir = sourceRoot / "pack"
+    torrentDir.mkdir(parents=True)
+    for name, content in files.items():
+        (torrentDir / name).write_bytes(content)
+
+    fs = lt.list_files(str(torrentDir))
+    ct = lt.create_torrent(fs, piece_size=16384)
+    lt.set_piece_hashes(ct, str(sourceRoot))
+    torrentData = lt.bencode(ct.generate())
+
+    layout = lt.load_torrent_buffer(torrentData).ti.layout()
+    indexByName = {
+        Path(layout.file_path(i)).name: i
+        for i in range(layout.num_files())
+        if not (layout.file_flags(i) & lt.file_storage.flag_pad_file)
+    }
+    return torrentData, indexByName
+
+
+async def startLocalSeeder(
+    sourceRoot: Path, torrentData: bytes, startServer, *, uploadRateLimit: int = 0,
+) -> tuple[lt.session, lt.torrent_handle, str]:
+    seeder = lt.session({
+        "listen_interfaces": "127.0.0.1:0",
+        "enable_dht": False,
+        "enable_lsd": False,
+        "enable_upnp": False,
+        "enable_natpmp": False,
+        "upload_rate_limit": uploadRateLimit,
+        "ignore_limits_on_local_network": uploadRateLimit == 0,
+    })
+    params = lt.load_torrent_buffer(torrentData)
+    params.save_path = str(sourceRoot)
+    handle = seeder.add_torrent(params)
+    handle.resume()
+    async with asyncio.timeout(5):
+        while not handle.status().is_seeding:
+            await asyncio.sleep(0.05)
+    peer = socket.inet_aton("127.0.0.1") + seeder.listen_port().to_bytes(2, "big")
+    body = lt.bencode({b"interval": 60, b"peers": peer})
+
+    async def announce(_):
+        return web.Response(body=body)
+
+    trackerUrl = (await startServer(announce)).removesuffix("/file") + "/announce"
+    return seeder, handle, trackerUrl
+
+
+async def test_run_downloads_newly_selected_file_after_resume(config, startServer, tmp_path):
+    payloads = {"a.bin": b"A" * 20000, "b.bin": b"B" * 20000, "c.bin": b"C" * 20000}
+    torrentData, indexByName = buildMultiFileTorrent(tmp_path, payloads)
+    seeder, seederHandle, trackerUrl = await startLocalSeeder(tmp_path / "source", torrentData, startServer)
+
+    cfg.set(bittorrentConfig.enableDht, False)
+    cfg.set(bittorrentConfig.enableLsd, False)
+
+    saveDir = tmp_path / "downloads"
+    session = BTSession()
+    try:
+        async with asyncio.timeout(10):
+            resumeData = await session.run(
+                "t1",
+                TorrentParams(
+                    torrentData=torrentData,
+                    savePath=str(saveDir),
+                    trackers=[trackerUrl],
+                    selectedIndexes={indexByName["a.bin"]},
+                ),
+            )
+
+        assert (saveDir / "pack" / "a.bin").read_bytes() == payloads["a.bin"]
+        assert not (saveDir / "pack" / "b.bin").exists()
+        assert not (saveDir / "pack" / "c.bin").exists()
+
+        async with asyncio.timeout(10):
+            await session.run(
+                "t1",
+                TorrentParams(
+                    torrentData=torrentData,
+                    savePath=str(saveDir),
+                    resumeData=resumeData,
+                    trackers=[trackerUrl],
+                    selectedIndexes={indexByName["a.bin"], indexByName["b.bin"]},
+                ),
+            )
+
+        assert (saveDir / "pack" / "a.bin").read_bytes() == payloads["a.bin"]
+        assert (saveDir / "pack" / "b.bin").read_bytes() == payloads["b.bin"]
+        assert not (saveDir / "pack" / "c.bin").exists()
+    finally:
+        await session.close()
+        seeder.remove_torrent(seederHandle)
+
+
+async def test_set_selection_downloads_newly_selected_file(config, startServer, tmp_path):
+    payloads = {"a.bin": b"A" * 20000, "b.bin": b"B" * 20000, "c.bin": b"C" * 20000}
+    torrentData, indexByName = buildMultiFileTorrent(tmp_path, payloads)
+    seeder, seederHandle, trackerUrl = await startLocalSeeder(
+        tmp_path / "source", torrentData, startServer, uploadRateLimit=16384,
+    )
+
+    cfg.set(bittorrentConfig.enableDht, False)
+    cfg.set(bittorrentConfig.enableLsd, False)
+
+    saveDir = tmp_path / "downloads"
+    session = BTSession()
+    didSelect = False
+
+    def onProgress(_):
+        nonlocal didSelect
+        if not didSelect:
+            didSelect = True
+            session.setSelection("t1", {indexByName["a.bin"], indexByName["b.bin"]})
+
+    try:
+        async with asyncio.timeout(10):
+            await session.run(
+                "t1",
+                TorrentParams(
+                    torrentData=torrentData,
+                    savePath=str(saveDir),
+                    trackers=[trackerUrl],
+                    selectedIndexes={indexByName["a.bin"]},
+                ),
+                onProgress=onProgress,
+            )
+
+        assert (saveDir / "pack" / "a.bin").read_bytes() == payloads["a.bin"]
+        assert (saveDir / "pack" / "b.bin").read_bytes() == payloads["b.bin"]
+        assert not (saveDir / "pack" / "c.bin").exists()
+    finally:
+        await session.close()
+        seeder.remove_torrent(seederHandle)
