@@ -19,6 +19,7 @@ PAN_ORIGIN = "https://pan.quark.cn"
 TEMP_FOLDER_NAME = "_ghd_tmp"
 PAGE_SIZE = 50
 MAX_PAGES = 100
+SAVE_BATCH_SIZE = 50
 TASK_STATUS_DONE = 2
 TASK_STATUS_FAILED = 3
 SAVE_POLL_LIMIT = 30
@@ -44,7 +45,16 @@ QUARK_PC_UA = (
 PASSCODE_CODES = {41006, 41008}
 EXPIRED_CODES = {41004, 41010, 41011, 41012, 41019}
 AUTH_CODES = {31001, 31004}
+CAPACITY_CODES = {32003}
+SAVE_LIMIT_CODES = {41016, 41028}
+RATE_LIMIT_CODES = {31019, 32004}
+NON_RETRYABLE_SAVE_KINDS = frozenset({
+    "auth", "passcode", "expired", "capacity", "save_limit", "rate_limit",
+})
 EXPIRED_WORDS = ("失效", "不存在", "已取消", "已删除")
+CAPACITY_WORDS = ("capacity limit", "容量不足", "空间不足", "容量已满", "空间已满")
+SAVE_LIMIT_WORDS = ("file count limit", "save limit", "文件数", "转存数量", "超出限制", "超过上限")
+RATE_LIMIT_WORDS = ("too many requests", "rate limit", "频繁", "限流")
 
 
 @dataclass(frozen=True)
@@ -227,20 +237,48 @@ def sanitize(text: str) -> str:
     return text.replace("{", "(").replace("}", ")")
 
 
+def toKnownDriveError(
+    codeNumber: int | None, message: str, httpStatus: int = 200,
+) -> TaskError | None:
+    lowered = message.lower()
+    if httpStatus in (401, 403) or codeNumber in AUTH_CODES or "未登录" in message or "not login" in lowered:
+        return TaskError("夸克账号未登录或 Cookie 已失效，请在设置中重新登录", kind="auth")
+    if httpStatus == 429 or codeNumber in RATE_LIMIT_CODES or any(word in lowered for word in RATE_LIMIT_WORDS):
+        return TaskError("夸克网盘请求过于频繁，请稍后再试", kind="rate_limit")
+    if codeNumber in CAPACITY_CODES or any(word in lowered for word in CAPACITY_WORDS):
+        return TaskError("夸克网盘空间不足，请清理网盘文件、临时目录或回收站后重试", kind="capacity")
+    if codeNumber in SAVE_LIMIT_CODES or any(word in lowered for word in SAVE_LIMIT_WORDS):
+        return TaskError("超出夸克网盘单次转存文件数量限制，请分批勾选后重试", kind="save_limit")
+    if codeNumber in PASSCODE_CODES or "提取码" in message:
+        return TaskError("提取码错误，请核对后再试", kind="passcode")
+    if codeNumber in EXPIRED_CODES or any(word in message for word in EXPIRED_WORDS):
+        return TaskError("分享已失效或已取消", kind="expired")
+    return None
+
+
+def toTaskFailureReason(data: dict, payload: dict) -> str:
+    for candidate in (
+        data.get("message"),
+        data.get("err_msg"),
+        data.get("error_msg"),
+        payload.get("message"),
+        data.get("task_title"),
+    ):
+        text = str(candidate or "").strip()
+        if text and text.lower() != "ok":
+            return text
+    return ""
+
+
 def toDriveError(payload: dict, httpStatus: int) -> TaskError | None:
     code = payload.get("code", 0)
     message = str(payload.get("message") or "").strip()
     codeNumber = toCodeNumber(code)
-    if httpStatus in (401, 403):
-        return TaskError("夸克账号未登录或 Cookie 已失效")
     if httpStatus < 400 and code in (0, "0", None, "OK") and payload.get("status", 200) in (200, "200", None):
         return None
-    if codeNumber in PASSCODE_CODES or "提取码" in message:
-        return TaskError("提取码错误，请核对后再试")
-    if codeNumber in EXPIRED_CODES or any(word in message for word in EXPIRED_WORDS):
-        return TaskError("分享已失效")
-    if codeNumber in AUTH_CODES or "未登录" in message:
-        return TaskError("夸克账号未登录或 Cookie 已失效")
+    known = toKnownDriveError(codeNumber, message, httpStatus)
+    if known is not None:
+        return known
     if httpStatus >= 400:
         if code not in (0, "0", None, ""):
             return TaskError(
@@ -414,6 +452,7 @@ class QuarkClient:
         panBase: str = PAN_BASE,
         authBase: str = AUTH_BASE,
         pageSize: int = PAGE_SIZE,
+        saveBatchSize: int = SAVE_BATCH_SIZE,
         onCookieUpdated: Callable[[str], None] | None = None,
     ) -> None:
         self._clientFactory = clientFactory or buildClient
@@ -422,9 +461,11 @@ class QuarkClient:
         self.panBase = panBase.rstrip("/")
         self.authBase = authBase.rstrip("/")
         self.pageSize = pageSize
+        self.saveBatchSize = max(1, saveBatchSize)
         self.onCookieUpdated = onCookieUpdated
         self._cookie = ""
         self._baseCookie = ""
+        self._tempFolderLock = asyncio.Lock()
 
     def driveQuery(self, extra: dict | None = None) -> dict:
         return {"pr": "ucpro", "fr": "pc", "uc_param_str": "", **(extra or {})}
@@ -491,6 +532,7 @@ class QuarkClient:
                 "stoken": stoken,
                 "pdir_fid": pdirFid,
                 "_fetch_share": 1,
+                "_fetch_total": 1,
                 "force": 0,
             }),
         )
@@ -542,14 +584,15 @@ class QuarkClient:
             tree.append((entry, relativePath))
 
     async def ensureTempFolder(self, taskId: str) -> str:
-        root = await self.fetchDriveFiles("0")
-        tempRoot = next((entry for entry in root if entry.isDir and entry.name == TEMP_FOLDER_NAME), None)
-        tempRootFid = tempRoot.fid if tempRoot is not None else await self.createFolder("0", TEMP_FOLDER_NAME)
-        children = await self.fetchDriveFiles(tempRootFid)
-        existing = next((entry for entry in children if entry.isDir and entry.name == taskId), None)
-        if existing is not None:
-            return existing.fid
-        return await self.createFolder(tempRootFid, taskId)
+        async with self._tempFolderLock:
+            root = await self.fetchDriveFiles("0")
+            tempRoot = next((entry for entry in root if entry.isDir and entry.name == TEMP_FOLDER_NAME), None)
+            tempRootFid = tempRoot.fid if tempRoot is not None else await self.createFolder("0", TEMP_FOLDER_NAME)
+            children = await self.fetchDriveFiles(tempRootFid)
+            existing = next((entry for entry in children if entry.isDir and entry.name == taskId), None)
+            if existing is not None:
+                return existing.fid
+            return await self.createFolder(tempRootFid, taskId)
 
     async def fetchTempFolders(self) -> list[DriveEntry]:
         root = await self.fetchDriveFiles("0")
@@ -581,39 +624,49 @@ class QuarkClient:
         files: list[ShareEntry],
         taskId: str,
         folderFid: str = "",
+        *,
+        onFolderReady: Callable[[str], None] | None = None,
+        onBatchSaved: Callable[[dict[str, str]], None] | None = None,
+        usedFids: set[str] | None = None,
     ) -> SaveResult:
         if not files:
             raise TaskError("没有可转存的文件")
         if not folderFid:
             folderFid = await self.ensureTempFolder(taskId)
+        if onFolderReady is not None:
+            onFolderReady(folderFid)
         savedFidBySource: dict[str, str] = {}
-        used: set[str] = set()
+        used: set[str] = set(usedFids or ())
         remoteTaskId = ""
         for pdirFid, group in groupShareEntries(files):
-            payload = await self.requestJson(
-                "POST", f"{self.driveBase}/share/sharepage/save",
-                query=self.driveQuery(),
-                body={
-                    "fid_list": [entry.fid for entry in group],
-                    "fid_token_list": [entry.shareFidToken for entry in group],
-                    "to_pdir_fid": folderFid,
-                    "pwd_id": pwdId,
-                    "stoken": stoken,
-                    "pdir_fid": pdirFid,
-                    "scene": "link",
-                },
-            )
-            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-            remoteTaskId = str(data.get("task_id") or "")
-            if not remoteTaskId:
-                raise TaskError("转存失败：未返回任务编号")
-            ordered, listed = await self.pollSaveTask(remoteTaskId, folderFid)
-            if ordered is not None and len(ordered) != len(group):
-                ordered = None
-                listed = await self.fetchDriveFiles(folderFid)
-            mapped = mapSavedFids(group, ordered, listed, used)
-            savedFidBySource.update(mapped)
-            used.update(mapped.values())
+            for offset in range(0, len(group), self.saveBatchSize):
+                batch = group[offset:offset + self.saveBatchSize]
+                payload = await self.requestJson(
+                    "POST", f"{self.driveBase}/share/sharepage/save",
+                    query=self.driveQuery(),
+                    body={
+                        "fid_list": [entry.fid for entry in batch],
+                        "fid_token_list": [entry.shareFidToken for entry in batch],
+                        "to_pdir_fid": folderFid,
+                        "pwd_id": pwdId,
+                        "stoken": stoken,
+                        "pdir_fid": pdirFid,
+                        "scene": "link",
+                    },
+                )
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                remoteTaskId = str(data.get("task_id") or "")
+                if not remoteTaskId:
+                    raise TaskError("转存失败：未返回任务编号")
+                ordered, listed = await self.pollSaveTask(remoteTaskId, folderFid)
+                if ordered is not None and len(ordered) != len(batch):
+                    ordered = None
+                    listed = await self.fetchDriveFiles(folderFid)
+                mapped = mapSavedFids(batch, ordered, listed, used)
+                savedFidBySource.update(mapped)
+                used.update(mapped.values())
+                if onBatchSaved is not None:
+                    onBatchSaved(mapped)
         return SaveResult(
             taskId=remoteTaskId,
             savedFids=[savedFidBySource[entry.fid] for entry in files],
@@ -637,8 +690,12 @@ class QuarkClient:
                 entries = await self.fetchDriveFiles(folderFid)
                 return None, entries
             if status == TASK_STATUS_FAILED:
-                detail = str(data.get("task_title") or payload.get("message") or "任务失败")
-                raise TaskError("转存失败：{detail}", detail=sanitize(detail))
+                reason = toTaskFailureReason(data, payload)
+                codeNumber = toCodeNumber(data.get("code") or payload.get("code"))
+                known = toKnownDriveError(codeNumber, reason)
+                if known is not None:
+                    raise known
+                raise TaskError("转存失败：{detail}", detail=sanitize(reason or "任务失败"))
             await asyncio.sleep(TASK_POLL_INTERVAL)
         raise TaskError("转存超时，请稍后重试")
 
@@ -738,10 +795,10 @@ class QuarkClient:
         if len(pageItems) < self.pageSize:
             return True
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-        total = metadata.get("_total")
-        if total is None:
+        total = toInt(metadata.get("_total"))
+        if total <= 0:
             return False
-        return page * self.pageSize >= toInt(total)
+        return page * self.pageSize >= total
 
     async def requestJson(
         self, method: str, url: str, *, query: dict | None = None, body: dict | None = None,
@@ -819,7 +876,9 @@ class QuarkClient:
             logger.warning(
                 "夸克网盘请求失败 {} cookie={}", type(error).__name__, toMaskedCookie(cookie) or "无",
             )
-            raise TaskError("夸克网盘请求失败") from None
+            if isinstance(error, TimeoutError) or "timeout" in type(error).__name__.lower():
+                raise TaskError("夸克网盘请求超时，请检查网络或代理设置后重试") from None
+            raise TaskError("夸克网盘网络连接失败，请检查网络或代理设置后重试") from None
         finally:
             if response is not None:
                 close = response.close()

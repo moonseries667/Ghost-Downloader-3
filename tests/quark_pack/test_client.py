@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from loguru import logger
 
 from app.config.cfg import cfg
 from app.models.task import TaskError
-from quark_pack.client import QUARK_PC_UA, QuarkClient, ShareEntry, mergeCookies
+from quark_pack.client import QUARK_PC_UA, QuarkClient, ShareEntry, mergeCookies, toDriveError
 from quark_pack.config import quarkConfig
 from tests.quark_pack.conftest import buildQuarkClient, buildQuarkTestClient
 
@@ -310,3 +312,109 @@ async def test_switching_read_cookie_drops_merged_cookie(quarkOrigin):
     configured["value"] = "__pus=alpha-value"
     client.clearCookie()
     assert client.currentCookie() == "__pus=alpha-value"
+
+
+async def test_save_share_files_maps_capacity_limit_to_friendly_error(quarkOrigin):
+    quarkOrigin.saveError = (400, {"code": 32003, "message": "capacity limit[{0}]"})
+    files = [ShareEntry("file-b", "b.txt", 12, False, "tok-b", "b.txt")]
+    client = buildQuarkClient(quarkOrigin, readCookie=lambda: RAW_COOKIE)
+
+    with pytest.raises(TaskError) as caught:
+        await client.saveShareFiles("pwd1", "stoken-1", files, "task-cap")
+
+    text = str(caught.value)
+    assert "空间不足" in text
+    assert "回收站" in text
+    assert "capacity limit" not in text.lower()
+    assert caught.value.params["kind"] == "capacity"
+
+
+async def test_poll_save_task_reports_real_error_instead_of_task_title(quarkOrigin):
+    files = [ShareEntry("file-b", "b.txt", 12, False, "tok-b", "b.txt")]
+    client = buildQuarkClient(quarkOrigin, readCookie=lambda: RAW_COOKIE)
+
+    quarkOrigin.taskFailure = {
+        "code": 0,
+        "status": 200,
+        "message": "ok",
+        "data": {"status": 3, "task_title": "分享-转存", "message": "capacity limit[{0}]"},
+    }
+    with pytest.raises(TaskError) as capCaught:
+        await client.saveShareFiles("pwd1", "stoken-1", files, "task-poll-cap")
+    assert "空间不足" in str(capCaught.value)
+    assert capCaught.value.params["kind"] == "capacity"
+
+    quarkOrigin.taskFailure = {
+        "code": 0,
+        "status": 200,
+        "message": "ok",
+        "data": {"status": 3, "task_title": "分享-转存", "err_msg": "文件包含违规内容"},
+    }
+    with pytest.raises(TaskError) as detailCaught:
+        await client.saveShareFiles("pwd1", "stoken-1", files, "task-poll-detail")
+    assert "文件包含违规内容" in str(detailCaught.value)
+    assert "分享-转存" not in str(detailCaught.value)
+
+
+def test_to_drive_error_maps_save_limit_and_rate_limit():
+    saveLimit = toDriveError({"code": 41016, "message": "file count limit"}, 400)
+    assert saveLimit is not None
+    assert "单次转存文件数量限制" in str(saveLimit)
+    assert saveLimit.params["kind"] == "save_limit"
+
+    rateLimit = toDriveError({"code": 32004, "message": "too many requests"}, 429)
+    assert rateLimit is not None
+    assert "请求过于频繁" in str(rateLimit)
+    assert rateLimit.params["kind"] == "rate_limit"
+
+
+async def test_fetch_share_tree_continues_when_metadata_total_is_zero(quarkOrigin):
+    quarkOrigin.omitMetadataTotal = True
+    quarkOrigin.shareLists = {
+        "0": [
+            {"fid": "f1", "file_name": "a.txt", "size": 10, "dir": False, "share_fid_token": "t1"},
+            {"fid": "f2", "file_name": "b.txt", "size": 20, "dir": False, "share_fid_token": "t2"},
+        ],
+    }
+    client = buildQuarkClient(quarkOrigin, pageSize=1, readCookie=lambda: RAW_COOKIE)
+
+    tree = await client.fetchShareTree("pwd1", "")
+
+    assert [item.fid for item in tree.files] == ["f1", "f2"]
+    detailCalls = [call for call in quarkOrigin.calls if call["path"].endswith("/share/sharepage/detail")]
+    assert [call["query"]["_page"] for call in detailCalls] == ["1", "2", "3"]
+    assert all(call["query"].get("_fetch_total") == "1" for call in detailCalls)
+
+
+async def test_save_share_files_chunks_large_folder_into_batches(quarkOrigin):
+    quarkOrigin.taskDoneAfter = 1
+    quarkOrigin.mapSavedFids = True
+    files = [
+        ShareEntry(f"file-{i}", f"f{i}.txt", 10 + i, False, f"tok-{i}", f"f{i}.txt", pdirFid="0")
+        for i in range(5)
+    ]
+    client = buildQuarkClient(quarkOrigin, saveBatchSize=2, readCookie=lambda: RAW_COOKIE)
+
+    result = await client.saveShareFiles("pwd1", "stoken-1", files, "task-batch")
+
+    assert [len(body["fid_list"]) for body in quarkOrigin.saveBodies] == [2, 2, 1]
+    assert result.savedFids == [f"saved-file-{i}" for i in range(5)]
+
+
+async def test_ensure_temp_folder_serializes_concurrent_root_creation(quarkOrigin):
+    quarkOrigin.createFolderDelay = 0.05
+    client = buildQuarkClient(quarkOrigin, readCookie=lambda: RAW_COOKIE)
+
+    first, second = await asyncio.gather(
+        client.ensureTempFolder("task-1"),
+        client.ensureTempFolder("task-2"),
+    )
+
+    assert first == "fid-task-1"
+    assert second == "fid-task-2"
+    createdRoots = [
+        call["body"]["file_name"]
+        for call in quarkOrigin.calls
+        if call["method"] == "POST" and call["path"].endswith("/file") and call["body"]["pdir_fid"] == "0"
+    ]
+    assert createdRoots == ["_ghd_tmp"]

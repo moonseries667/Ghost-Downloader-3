@@ -14,7 +14,12 @@ def buildQuarkTestClient(*, headers=None, userAgent=None, **_kwargs):
 
 
 def buildQuarkClient(
-    origin: QuarkOrigin, *, pageSize: int = 50, readCookie=None, onCookieUpdated=None,
+    origin: QuarkOrigin,
+    *,
+    pageSize: int = 50,
+    saveBatchSize: int = 50,
+    readCookie=None,
+    onCookieUpdated=None,
 ) -> QuarkClient:
     return QuarkClient(
         clientFactory=buildQuarkTestClient,
@@ -23,6 +28,7 @@ def buildQuarkClient(
         panBase=origin.panBase,
         authBase=origin.authBase,
         pageSize=pageSize,
+        saveBatchSize=saveBatchSize,
         onCookieUpdated=onCookieUpdated,
     )
 
@@ -86,6 +92,11 @@ class QuarkOrigin:
         self.omitSaveAsFor: set[str] = set()
         self.fallbackEntries: dict[str, dict] = {}
         self.failSaves = 0
+        self.saveError: tuple[int, dict] | None = None
+        self.saveErrorByPdir: dict[str, tuple[int, dict]] = {}
+        self.taskFailure: dict | None = None
+        self.omitMetadataTotal = False
+        self.createFolderDelay = 0.0
         self.downloadRoot = "https://download.example"
         self.deleteBodies: list[dict] = []
         self.qrScript = ["waiting", "scanned", "success"]
@@ -149,6 +160,9 @@ class QuarkOrigin:
         if path.endswith("/task"):
             return self.taskResponse(request)
         if request.method == "POST" and path.endswith("/file"):
+            if self.createFolderDelay > 0:
+                import asyncio
+                await asyncio.sleep(self.createFolderDelay)
             return self.createFolder(body or {})
         return web.json_response({"code": 404, "message": "not found"}, status=404)
 
@@ -175,6 +189,13 @@ class QuarkOrigin:
         return web.json_response(qrPayload(step))
 
     def saveResponse(self, body: dict) -> web.StreamResponse:
+        pdir = str(body.get("pdir_fid") or "0")
+        if pdir in self.saveErrorByPdir:
+            status, payload = self.saveErrorByPdir[pdir]
+            return web.json_response(payload, status=status)
+        if self.saveError is not None:
+            status, payload = self.saveError
+            return web.json_response(payload, status=status)
         if self.failSaves > 0:
             self.failSaves -= 1
             return web.json_response({
@@ -209,6 +230,8 @@ class QuarkOrigin:
         self.taskHits += 1
         query = dict(request.query)
         self.taskQueries.append(query)
+        if self.taskFailure is not None:
+            return web.json_response(self.taskFailure)
         taskId = query.get("task_id", "")
         polls = self.taskPolls.get(taskId, 0) + 1
         self.taskPolls[taskId] = polls
@@ -245,7 +268,11 @@ class QuarkOrigin:
             "status": 200,
             "message": "ok",
             "data": {"list": items[start:start + size]},
-            "metadata": {"_total": len(items), "_page": page, "_size": size},
+            "metadata": {
+                "_total": 0 if self.omitMetadataTotal else len(items),
+                "_page": page,
+                "_size": size,
+            },
         })
 
     def ok(self, data: dict) -> web.StreamResponse:

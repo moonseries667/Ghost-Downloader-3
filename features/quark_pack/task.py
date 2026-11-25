@@ -10,7 +10,9 @@ from loguru import logger
 
 from app.models.task import Task, TaskError, TaskFile, TaskStatus, toTaskError
 from http_pack.task import HttpTaskStep
-from .client import QUARK_PC_UA, DriveEntry, QuarkClient, ShareEntry, readConfigCookie
+from .client import (
+    NON_RETRYABLE_SAVE_KINDS, QUARK_PC_UA, DriveEntry, QuarkClient, ShareEntry, readConfigCookie,
+)
 from .config import quarkConfig
 
 PAN_REFERER = "https://pan.quark.cn/"
@@ -211,24 +213,60 @@ class QuarkTask(Task):
         if not pending:
             return
         if not readConfigCookie():
-            raise TaskError("请先在设置中登录夸克账号")
-        entries = [shareEntryFromFile(file) for file in pending]
+            raise TaskError("请先在设置中登录夸克账号", kind="auth")
+        hadTempFolder = bool(self.tempFolderFid)
+        byFid = {file.fid: file for file in pending}
+
+        def onFolderReady(folderFid: str) -> None:
+            self.tempFolderFid = folderFid
+
+        def onBatchSaved(mapped: dict[str, str]) -> None:
+            for sourceFid, savedFid in mapped.items():
+                file = byFid.get(sourceFid)
+                if file is not None and savedFid:
+                    file.savedFid = savedFid
+
+        async def runSave() -> None:
+            remaining = [file for file in pending if not file.savedFid]
+            if not remaining:
+                return
+            result = await client.saveShareFiles(
+                self.pwdId,
+                self.stoken,
+                [shareEntryFromFile(file) for file in remaining],
+                self.taskId,
+                folderFid=self.tempFolderFid,
+                onFolderReady=onFolderReady,
+                onBatchSaved=onBatchSaved,
+                usedFids={file.savedFid for file in self.files if file.savedFid},
+            )
+            self.tempFolderFid = result.folderFid
+            for file in remaining:
+                savedFid = result.savedFidBySource.get(file.fid, "")
+                if not savedFid:
+                    raise TaskError("转存完成，但未能对应文件 {name}", name=file.relativePath)
+                file.savedFid = savedFid
+
         try:
-            result = await client.saveShareFiles(
-                self.pwdId, self.stoken, entries, self.taskId, folderFid=self.tempFolderFid,
-            )
-        except TaskError:
-            await self.refreshShare(client)
-            entries = [shareEntryFromFile(file) for file in pending]
-            result = await client.saveShareFiles(
-                self.pwdId, self.stoken, entries, self.taskId, folderFid=self.tempFolderFid,
-            )
-        self.tempFolderFid = result.folderFid
-        for file in pending:
-            savedFid = result.savedFidBySource.get(file.fid, "")
-            if not savedFid:
-                raise TaskError("转存完成，但未能对应文件 {name}", name=file.relativePath)
-            file.savedFid = savedFid
+            try:
+                await runSave()
+            except TaskError as error:
+                if error.params.get("kind") in NON_RETRYABLE_SAVE_KINDS:
+                    raise
+                await self.refreshShare(client)
+                await runSave()
+        except Exception:
+            if not hadTempFolder and self.tempFolderFid and not any(file.savedFid for file in self.files):
+                await self._cleanEmptyTemp(client)
+            raise
+
+    async def _cleanEmptyTemp(self, client: QuarkClient) -> None:
+        folderFid = self.tempFolderFid
+        self.tempFolderFid = ""
+        try:
+            await client.deleteRemote([folderFid])
+        except Exception as error:
+            logger.warning("清理空夸克临时目录失败 {}", type(error).__name__)
 
     async def refreshShare(self, client: QuarkClient) -> None:
         tree = await client.fetchShareTree(self.pwdId, self.passcode)

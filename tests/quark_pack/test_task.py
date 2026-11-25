@@ -468,3 +468,67 @@ async def test_qr_requests_do_not_send_saved_cookie(quarkOrigin):
     assert len(qrCalls) == 3
     assert all(call["cookie"] == "" for call in qrCalls)
     assert COOKIE not in json.dumps(qrCalls)
+
+
+async def test_capacity_limit_skips_retry_and_cleans_empty_temp_folder(quarkOrigin, downloadFolder):
+    quarkOrigin.shareLists = {"0": [shareFile("file-b", "b.txt", 256, "tok-b")]}
+    quarkOrigin.saveError = (400, {"code": 32003, "message": "capacity limit[{0}]"})
+    task = await parseShare(quarkOrigin, "https://pan.quark.cn/s/plain001", downloadFolder)
+
+    with pytest.raises(TaskError, match="空间不足") as caught:
+        await runStep(task.steps[0])
+
+    assert "capacity limit" not in str(caught.value).lower()
+    tokenCalls = [call for call in quarkOrigin.calls if call["path"].endswith("/share/sharepage/token")]
+    saveCalls = [call for call in quarkOrigin.calls if call["path"].endswith("/share/sharepage/save")]
+    assert len(tokenCalls) == 1
+    assert len(saveCalls) == 1
+    assert quarkOrigin.deleteBodies == [{
+        "action_type": 2,
+        "filelist": [f"fid-{task.taskId}"],
+        "exclude_fids": [],
+    }]
+    assert task.tempFolderFid == ""
+    assert task.files[0].savedFid == ""
+
+
+async def test_partial_multi_folder_capacity_failure_resumes_only_remaining(
+    quarkOrigin, startServer, downloadFolder,
+):
+    nested = b"nested-a" * 30
+    rootFile = b"root-b" * 40
+    quarkOrigin.shareLists = {
+        "0": [
+            {"fid": "dir-1", "file_name": "目录甲", "size": 0, "dir": True, "share_fid_token": "tok-dir"},
+            shareFile("file-b", "b.txt", len(rootFile), "tok-b"),
+        ],
+        "dir-1": [shareFile("file-a", "a.txt", len(nested), "tok-a")],
+    }
+    root, _state = await serveBytes(startServer, {
+        "saved-file-a": nested,
+        "saved-file-b": rootFile,
+    })
+    quarkOrigin.downloadRoot = root
+    quarkOrigin.saveErrorByPdir = {"0": (400, {"code": 32003, "message": "capacity limit[{0}]"})}
+    task = await parseShare(quarkOrigin, "https://pan.quark.cn/s/plain001", downloadFolder)
+
+    with pytest.raises(TaskError, match="空间不足"):
+        await runStep(task.steps[0])
+
+    assert [body["pdir_fid"] for body in quarkOrigin.saveBodies] == ["dir-1"]
+    assert quarkOrigin.deleteBodies == []
+    assert task.tempFolderFid == f"fid-{task.taskId}"
+    assert task.files[0].savedFid == "saved-file-a"
+    assert task.files[1].savedFid == ""
+
+    quarkOrigin.saveErrorByPdir.clear()
+    quarkOrigin.saveBodies.clear()
+    await runStep(task.steps[0])
+
+    assert [body["pdir_fid"] for body in quarkOrigin.saveBodies] == ["0"]
+    assert quarkOrigin.saveBodies[0]["fid_list"] == ["file-b"]
+    folder = downloadFolder / "分享标题"
+    assert (folder / "目录甲" / "a.txt").read_bytes() == nested
+    assert (folder / "b.txt").read_bytes() == rootFile
+    assert task.tempFolderFid == ""
+    assert quarkOrigin.deleteBodies
