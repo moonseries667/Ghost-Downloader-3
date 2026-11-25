@@ -44,7 +44,7 @@ jobs:
       - name: Run Windows regression tests
         env:
           QT_QPA_PLATFORM: offscreen
-        run: uv run --no-sync pytest tests/quark_pack/ tests/telegram_pack/ tests/test_deploy.py tests/test_feature_service.py tests/test_task.py -q
+        run: uv run --no-sync pytest tests/quark_pack/ tests/telegram_pack/ tests/test_deploy.py tests/test_feature_service.py tests/test_main_window.py tests/test_task.py -q
 
       - name: Resolve version and release tag
         id: meta

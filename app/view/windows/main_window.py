@@ -164,7 +164,7 @@ class MainWindow(MSFluentWindow):
             self.navigationInterface.addItem(
                 routeKey=routeKey, icon=PageClass.icon,
                 text=QCoreApplication.translate("PackPage", PageClass.title),
-                onClick=lambda cls=PageClass, key=routeKey: self._showPage(
+                onClick=lambda _=False, cls=PageClass, key=routeKey: self._showPage(
                     key, lambda: self._featureService.createPage(cls, parent=self),
                 ),
                 position=NavigationItemPosition.TOP,
