@@ -14,6 +14,8 @@ from app.models.pack import PackServices
 from app.services.plan import Plan
 from app.view.qfw_patch import patchLinuxFrameless
 from app.view.windows.main_window import MainWindow
+from baidu_pack.pack import BaiduPack
+from baidu_pack.page import BaiduPage
 from quark_pack.config import quarkConfig
 from quark_pack.pack import QuarkPack
 from quark_pack.page import QuarkPage
@@ -41,6 +43,7 @@ def mainWindow(qapp, engine, monkeypatch):
     )
     engine.featureService.register(QuarkPack(services))
     engine.featureService.register(TelegramPack(services))
+    engine.featureService.register(BaiduPack(services))
 
     window = MainWindow(
         engine.taskService,
@@ -75,6 +78,12 @@ async def test_click_pack_navigation_opens_quark_and_telegram_pages(mainWindow, 
     assert isinstance(telegramPage, TelegramPage)
     assert telegramPage.objectName() == "TelegramPage"
     assert mainWindow.searchEdit.placeholderText() == TelegramPage.searchPlaceholder
+
+    qtbot.mouseClick(mainWindow.navigationInterface.items["BaiduPage"], Qt.MouseButton.LeftButton)
+    baiduPage = mainWindow.stackedWidget.currentWidget()
+    assert isinstance(baiduPage, BaiduPage)
+    assert baiduPage.objectName() == "BaiduPage"
+    assert mainWindow.searchEdit.placeholderText() == BaiduPage.searchPlaceholder
 
 
 async def test_click_pack_navigation_reuses_created_page(mainWindow, qtbot):
