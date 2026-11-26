@@ -5,6 +5,7 @@ from dataclasses import replace
 from email.message import Message
 from email.utils import collapse_rfc2231_value
 from mimetypes import guess_extension
+from pathlib import Path
 from time import time_ns
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlparse, parse_qs
@@ -16,10 +17,12 @@ from app.config.cfg import cfg
 from app.i18n import N
 from app.models.pack import FeaturePack, TaskParser
 from app.models.task import (
-    RemoteFile, Task, TaskOptions, ResourceTaskOptions, SpecialFileSize,
+    RemoteFile, ResourceTaskOptions, SpecialFileSize, Task, TaskError, TaskOptions,
 )
 from app.platform.filesystem import toSafeFilename
-from .task import HttpTask, HttpTaskStep
+from .task import (
+    HTML_RESPONSE_ERROR, HTML_SUFFIXES, HttpTask, HttpTaskStep, isHtmlResponse,
+)
 
 if TYPE_CHECKING:
     from PySide6.QtWidgets import QWidget
@@ -36,6 +39,11 @@ DOWNLOADABLE_EXTENSIONS = frozenset({
     ".pdf", ".epub",
     ".apk", ".ipa",
 })
+
+
+def isHtmlUrlPath(url: str) -> bool:
+    cleanPath = unquote(urlparse(url).path).split(";", 1)[0]
+    return Path(cleanPath).suffix.lower() in HTML_SUFFIXES
 
 
 async def probe(options: TaskOptions) -> RemoteFile:
@@ -92,6 +100,15 @@ async def probe(options: TaskOptions) -> RemoteFile:
 
     try:
         statusCode, responseHeaders, finalUrl = await request("bytes=1-1")
+        if (
+            statusCode in {200, 206}
+            and isHtmlResponse(
+                responseHeaders.get("content-type", ""),
+                responseHeaders.get("content-disposition", ""),
+            )
+            and not isHtmlUrlPath(url)
+        ):
+            raise TaskError(HTML_RESPONSE_ERROR)
 
         fileSize = rangeTotal(responseHeaders)
         canUseRangeRequests = statusCode == 206 and "content-range" in responseHeaders
@@ -222,9 +239,21 @@ class HttpParser(TaskParser):
     async def parse(self, options: TaskOptions) -> Task:
         if options.isProbed:
             return buildTask(options)
-        if isinstance(options, ResourceTaskOptions) and options.name and options.size > 0:
-            file = RemoteFile(name=options.name, fileSize=options.size, canUseRangeRequests=options.canUseRangeRequests)
-            return await self.pack.parse(replace(options, file=file))
+        if isinstance(options, ResourceTaskOptions) and options.name:
+            if options.size > 0:
+                file = RemoteFile(
+                    name=options.name,
+                    fileSize=options.size,
+                    canUseRangeRequests=options.canUseRangeRequests,
+                )
+                return await self.pack.parse(replace(options, file=file))
+            if options.size == 0 and not options.canUseRangeRequests:
+                file = RemoteFile(
+                    name=options.name,
+                    fileSize=SpecialFileSize.UNKNOWN,
+                    canUseRangeRequests=False,
+                )
+                return await self.pack.parse(replace(options, file=file))
         return await self.pack.parse(replace(options, file=await probe(options)))
 
 

@@ -6,10 +6,12 @@ import pytest
 from aiohttp import web
 
 from app.models.pack import PackServices
-from app.models.task import ResourceTaskOptions, TaskOptions
+from app.models.task import (
+    ResourceTaskOptions, SpecialFileSize, TaskError, TaskOptions, TaskStatus,
+)
 from http_pack.pack import HttpPack
 from http_pack.task import HttpTask
-from tests.helpers import buildFileContent, buildRangeHandler
+from tests.helpers import buildFileContent, buildRangeHandler, waitUntil
 
 CONTENT = buildFileContent(1000)
 
@@ -66,3 +68,80 @@ async def test_parse_resource_with_size_sends_no_request(http, startServer):
 
     assert task.name == "a.zip"
     assert requests == []
+
+
+async def test_parse_unknown_size_single_stream_resource_skips_probe_and_downloads_once(
+    engine, http, startServer, downloadFolder,
+):
+    requests = []
+
+    async def chunkedStream(request: web.Request) -> web.StreamResponse:
+        requests.append(request)
+        response = web.StreamResponse(status=200, headers={"Content-Type": "application/zip"})
+        response.enable_chunked_encoding()
+        await response.prepare(request)
+        await response.write(CONTENT)
+        await response.write_eof()
+        return response
+
+    url = await startServer(chunkedStream)
+    options = ResourceTaskOptions(url=url, name="a.zip", size=0, canUseRangeRequests=False)
+
+    task = await http.parse(options)
+
+    assert isinstance(task, HttpTask)
+    assert task.name == "a.zip"
+    assert task.fileSize == SpecialFileSize.UNKNOWN
+    assert not task.steps[0].canUseRangeRequests
+    assert requests == []
+
+    engine.taskService.add(task)
+    await waitUntil(lambda: task.status == TaskStatus.COMPLETED)
+
+    assert len(requests) == 1
+    assert (downloadFolder / "a.zip").read_bytes() == CONTENT
+
+
+@pytest.mark.parametrize("contentType", [
+    "text/html; charset=utf-8",
+    "application/xhtml+xml; charset=utf-8",
+])
+async def test_probe_rejects_html_for_non_html_path(http, startServer, contentType):
+    async def htmlPage(request: web.Request) -> web.Response:
+        return web.Response(body=b"<html><body>sign in</body></html>", headers={"Content-Type": contentType})
+
+    url = await startServer(htmlPage)
+
+    with pytest.raises(TaskError, match="网页内容"):
+        await http.parse(TaskOptions(url=f"{url.replace('/file', '/download')}?id=1"))
+
+
+@pytest.mark.parametrize("path", ["/guide.html", "/guide.htm", "/guide.xhtml"])
+async def test_probe_allows_html_for_explicit_html_path(http, startServer, path):
+    async def htmlPage(request: web.Request) -> web.Response:
+        return web.Response(body=b"<html><body>doc</body></html>", headers={"Content-Type": "text/html; charset=utf-8"})
+
+    url = await startServer(htmlPage)
+
+    task = await http.parse(TaskOptions(url=url.replace("/file", path)))
+
+    assert isinstance(task, HttpTask)
+    assert task.name == path.lstrip("/")
+
+
+async def test_probe_allows_html_attachment(http, startServer):
+    async def htmlAttachment(request: web.Request) -> web.Response:
+        return web.Response(
+            body=b"<html><body>report</body></html>",
+            headers={
+                "Content-Type": "text/html; charset=utf-8",
+                "Content-Disposition": 'attachment; filename="report.html"',
+            },
+        )
+
+    url = await startServer(htmlAttachment)
+
+    task = await http.parse(TaskOptions(url=f"{url.replace('/file', '/download')}?id=1"))
+
+    assert isinstance(task, HttpTask)
+    assert task.name == "report.html"

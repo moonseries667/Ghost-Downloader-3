@@ -4,6 +4,7 @@ import asyncio
 import gzip
 from pathlib import Path
 from struct import pack
+from types import SimpleNamespace
 
 import pytest
 from aiohttp import web
@@ -14,10 +15,11 @@ from tests.helpers import buildFileContent, buildRangeHandler, runStep
 
 
 def buildStep(url: str, tmp_path: Path, *, fileSize: int, subworkerCount: int = 2,
-             canUseRangeRequests: bool = True, userAgent: str = "") -> tuple[HttpTask, HttpTaskStep]:
+             canUseRangeRequests: bool = True, userAgent: str = "",
+             name: str = "test.bin") -> tuple[HttpTask, HttpTaskStep]:
     step = HttpTaskStep(stepIndex=0, url=url, fileSize=fileSize, subworkerCount=subworkerCount,
                         canUseRangeRequests=canUseRangeRequests, userAgent=userAgent, clientProfile="raw")
-    task = HttpTask(name="test.bin", url=url, outputFolder=tmp_path, fileSize=fileSize, steps=[step])
+    task = HttpTask(name=name, url=url, outputFolder=tmp_path, fileSize=fileSize, steps=[step])
     task.setStatus(TaskStatus.RUNNING)
     return task, step
 
@@ -480,3 +482,199 @@ async def test_run_finishes_when_rejection_arrives_after_left_subworker_ends(sta
         await runStep(step)
 
     assert (tmp_path / "test.bin").read_bytes() == content
+
+
+async def test_single_stream_sends_identity_and_syncs_content_length(startServer, tmp_path):
+    content = buildFileContent(500)
+    acceptEncodings = []
+
+    async def fullBody(request: web.Request) -> web.Response:
+        acceptEncodings.append(request.headers.get("Accept-Encoding"))
+        return web.Response(body=content, headers={"Content-Length": str(len(content))})
+
+    url = await startServer(fullBody)
+    task, step = buildStep(
+        url, tmp_path, fileSize=SpecialFileSize.UNKNOWN, subworkerCount=1, canUseRangeRequests=False,
+    )
+
+    await runStep(step)
+
+    assert acceptEncodings == ["identity"]
+    assert step.fileSize == len(content)
+    assert task.fileSize == len(content)
+    assert (tmp_path / "test.bin").read_bytes() == content
+
+
+async def test_single_stream_retries_on_short_read_instead_of_completing(startServer, tmp_path, monkeypatch):
+    content = buildFileContent(1000)
+    attempts = 0
+    realSleep = asyncio.sleep
+
+    async def fastSleep(delay: float) -> None:
+        await realSleep(0.05 if delay >= 5 else delay)
+
+    monkeypatch.setattr("features.http_pack.task.asyncio.sleep", fastSleep)
+
+    async def truncatedThenFull(request: web.Request) -> web.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            request.transport.write(
+                f"HTTP/1.1 200 OK\r\nContent-Length: {len(content)}\r\nConnection: close\r\n\r\n".encode()
+                + content[:300]
+            )
+            request.transport.close()
+            return web.Response()
+        return web.Response(body=content, headers={"Content-Length": str(len(content))})
+
+    url = await startServer(truncatedThenFull)
+    task, step = buildStep(
+        url, tmp_path, fileSize=SpecialFileSize.UNKNOWN, subworkerCount=1, canUseRangeRequests=False,
+    )
+
+    async with asyncio.timeout(3):
+        await runStep(step)
+
+    assert attempts == 2
+    assert step.fileSize == len(content)
+    assert task.fileSize == len(content)
+    assert (tmp_path / "test.bin").read_bytes() == content
+
+
+async def test_single_stream_rejects_silent_short_read(tmp_path, monkeypatch):
+    content = buildFileContent(1000)
+    attempts = 0
+    realSleep = asyncio.sleep
+
+    async def fastSleep(delay: float) -> None:
+        await realSleep(0.05 if delay >= 5 else delay)
+
+    def buildFakeResponse(body: bytes):
+        headers = {
+            "content-length": str(len(content)).encode(),
+            "content-type": b"application/octet-stream",
+        }
+
+        async def stream():
+            yield body
+
+        return SimpleNamespace(
+            status=SimpleNamespace(as_int=lambda: 200),
+            headers=SimpleNamespace(
+                contains_key=lambda key: key.lower() in headers,
+                get=lambda key: headers.get(key.lower()),
+            ),
+            url="http://fake/file.bin",
+            stream=stream,
+            close=lambda: None,
+        )
+
+    async def fakeGet(url: str, headers: dict | None = None):
+        nonlocal attempts
+        attempts += 1
+        return buildFakeResponse(content[:300] if attempts == 1 else content)
+
+    monkeypatch.setattr("features.http_pack.task.asyncio.sleep", fastSleep)
+    monkeypatch.setattr(
+        "features.http_pack.task.buildClient",
+        lambda **kwargs: SimpleNamespace(get=fakeGet, close=lambda: None),
+    )
+
+    task, step = buildStep(
+        "http://fake/file.bin", tmp_path,
+        fileSize=SpecialFileSize.UNKNOWN, subworkerCount=1, canUseRangeRequests=False,
+    )
+
+    async with asyncio.timeout(3):
+        await runStep(step)
+
+    assert attempts == 2
+    assert step.fileSize == len(content)
+    assert task.fileSize == len(content)
+    assert (tmp_path / "test.bin").read_bytes() == content
+
+
+@pytest.mark.parametrize("fileSize, canUseRangeRequests, status", [
+    pytest.param(SpecialFileSize.UNKNOWN, False, 200, id="not-supported"),
+    pytest.param(1000, True, 200, id="confirm-file-size"),
+    pytest.param(SpecialFileSize.UNKNOWN, True, 206, id="unknown-range"),
+    pytest.param(SpecialFileSize.UNKNOWN, True, 200, id="unknown-range-200"),
+])
+async def test_run_fails_immediately_on_unexpected_html(startServer, tmp_path, fileSize, canUseRangeRequests, status):
+    requests = 0
+
+    async def htmlHandler(request: web.Request) -> web.Response:
+        nonlocal requests
+        requests += 1
+        body = b"<html><body>login required</body></html>"
+        headers = {"Content-Type": "text/html; charset=utf-8", "Content-Length": str(len(body))}
+        if status == 206:
+            headers["Content-Range"] = f"bytes 0-{len(body) - 1}/{len(body)}"
+        return web.Response(status=status, body=body, headers=headers)
+
+    url = await startServer(htmlHandler)
+    task, step = buildStep(
+        url, tmp_path, fileSize=fileSize, subworkerCount=1,
+        canUseRangeRequests=canUseRangeRequests, name="archive.zip",
+    )
+
+    with pytest.raises(TaskError, match="网页内容"):
+        await runStep(step)
+
+    assert requests == 1
+    assert task.status == TaskStatus.FAILED
+
+
+async def test_run_fails_immediately_on_html_during_resumed_range(startServer, tmp_path):
+    requests = 0
+
+    async def htmlRange(request: web.Request) -> web.Response:
+        nonlocal requests
+        requests += 1
+        body = b"<html><body>expired</body></html>"
+        return web.Response(
+            status=206,
+            body=body,
+            headers={
+                "Content-Type": "text/html; charset=utf-8",
+                "Content-Range": f"bytes 500-{500 + len(body) - 1}/1000",
+                "Content-Length": str(len(body)),
+            },
+        )
+
+    url = await startServer(htmlRange)
+    path = tmp_path / "archive.zip"
+    path.write_bytes(b"x" * 1000)
+    createRecord(path, (0, 500, 499), (500, 500, 999))
+    task, step = buildStep(url, tmp_path, fileSize=1000, subworkerCount=2, name="archive.zip")
+
+    with pytest.raises(TaskError, match="网页内容"):
+        await runStep(step)
+
+    assert requests == 1
+    assert task.status == TaskStatus.FAILED
+
+
+@pytest.mark.parametrize("name, disposition", [
+    pytest.param("page.html", "", id="html-target"),
+    pytest.param("archive.zip", 'attachment; filename="archive.zip"', id="html-attachment"),
+])
+async def test_run_allows_expected_html_or_attachment(startServer, tmp_path, name, disposition):
+    body = b"<html><body>ok</body></html>"
+
+    async def htmlHandler(request: web.Request) -> web.Response:
+        headers = {"Content-Type": "text/html; charset=utf-8", "Content-Length": str(len(body))}
+        if disposition:
+            headers["Content-Disposition"] = disposition
+        return web.Response(body=body, headers=headers)
+
+    url = await startServer(htmlHandler)
+    task, step = buildStep(
+        url, tmp_path, fileSize=SpecialFileSize.UNKNOWN, subworkerCount=1,
+        canUseRangeRequests=False, name=name,
+    )
+
+    await runStep(step)
+
+    assert task.status == TaskStatus.COMPLETED
+    assert (tmp_path / name).read_bytes() == body
