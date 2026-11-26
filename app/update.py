@@ -5,7 +5,7 @@ import sys
 from app.platform.arch import MACHINE_ARCH
 from app.sources import Release, ReleaseAsset, Repo, fetchLatestRelease, probeDownloadUrl
 
-APP_REPO = Repo("XiaoYouChR/Ghost-Downloader-3", mirrors={"gitcode": "XiaoYouChR/Ghost-Downloader-3"})
+APP_REPO = Repo("moonseries667/Ghost-Downloader-3")
 
 
 def parseVersion(s: str) -> tuple[int, ...]:

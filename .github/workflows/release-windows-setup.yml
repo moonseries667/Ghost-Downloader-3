@@ -44,7 +44,7 @@ jobs:
       - name: Run Windows regression tests
         env:
           QT_QPA_PLATFORM: offscreen
-        run: uv run --no-sync pytest tests/baidu_pack/ tests/quark_pack/ tests/telegram_pack/ tests/test_deploy.py tests/test_feature_service.py tests/test_main_window.py tests/test_task.py -q
+        run: uv run --no-sync pytest tests/baidu_pack/ tests/quark_pack/ tests/telegram_pack/ tests/http_pack/ tests/test_deploy.py tests/test_feature_service.py tests/test_main_window.py tests/test_task.py -q
 
       - name: Resolve version and release tag
         id: meta
@@ -151,8 +151,11 @@ jobs:
           $notes = @(
             "Ghost Downloader 3 Windows x86_64 安装包（基于上游 v$ver + QFW Fork）：",
             "",
+            "- 新增百度网盘下载模块（BaiduPCS-Go 运行时管理、只读分享树、扫码与 Cookie 登录、静默转存与临时清理）",
             "- 新增夸克网盘下载模块（分享多链接折叠树精选下载、我的网盘浏览、自动转存与临时目录清理、扫码与 Cookie 登录）",
             "- 新增 Telegram 下载模块（tdl 运行时管理、软件内置二维码与 2FA 登录、紧急链接直下、个人私密频道收件箱与媒体组聚合下载）",
+            "- 优化 HTTP 下载模块（浏览器扩展接管未知大小动态单流免冗余探测、单流 identity 与短读校验、非网页文件 HTML 误存拦截）",
+            "- 应用更新源指向自用仓库，防止被上游官方更新覆盖定制内容",
             "- 包含 Windows Setup 安装程序与绿色便携压缩包"
           ) -join "`n"
           gh release view $tag *> $null
