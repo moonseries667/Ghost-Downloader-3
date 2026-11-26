@@ -16,12 +16,44 @@ from wreq import HeaderMap
 
 from app.client import buildClient, toEmulation
 from app.config.cfg import cfg
-from app.models.task import Task, TaskError, TaskStep, TaskStatus, SpecialFileSize
+from app.models.task import (
+    SpecialFileSize, Task, TaskError, TaskStatus, TaskStep, WEB_PAGE_SUFFIXES,
+)
 from app.platform.sysio import ftruncate, pwrite
 
 STREAM_READ_TIMEOUT = 30
 PERMANENT_STATUS = frozenset({400, 401, 403, 404, 405, 410, 451})
 FATAL_IO_ERRNO = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EROFS, errno.EIO})
+HTML_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+HTML_SUFFIXES = frozenset({".html", ".htm", ".xhtml"})
+WEB_DOCUMENT_SUFFIXES = HTML_SUFFIXES | {".mhtml"} | WEB_PAGE_SUFFIXES
+HTML_RESPONSE_ERROR = "服务器返回了网页内容而非目标文件，可能需要登录、验证或链接已失效"
+
+
+def isHtmlResponse(contentType: str, contentDisposition: str) -> bool:
+    mediaType = contentType.split(";", 1)[0].strip().lower()
+    if mediaType not in HTML_CONTENT_TYPES:
+        return False
+    return contentDisposition.split(";", 1)[0].strip().lower() != "attachment"
+
+
+def isNonWebFilename(path: str) -> bool:
+    suffix = Path(path).suffix.lower()
+    return bool(suffix) and suffix not in WEB_DOCUMENT_SUFFIXES
+
+
+def decodeHeader(headers: HeaderMap, name: str) -> str:
+    value = headers.get(name)
+    return bytes(value).decode("latin-1") if value is not None else ""
+
+
+def isUnexpectedHtml(response, outputPath: str) -> bool:
+    if not isNonWebFilename(outputPath):
+        return False
+    return isHtmlResponse(
+        decodeHeader(response.headers, "content-type"),
+        decodeHeader(response.headers, "content-disposition"),
+    )
 
 
 class PermanentDownloadError(Exception):
@@ -309,6 +341,8 @@ class HttpTaskStep(TaskStep):
                         status = response.status.as_int()
                         if status in PERMANENT_STATUS or response.headers.contains_key("cf-mitigated"):
                             raise PermanentDownloadError(status)
+                        if status in {200, 206} and isUnexpectedHtml(response, self.outputPath):
+                            raise TaskError(HTML_RESPONSE_ERROR)
                         if status == 200:
                             raise RangeNotSupportedError()
                         if status != 206:
@@ -326,7 +360,7 @@ class HttpTaskStep(TaskStep):
                     return
                 except CancelledError:
                     raise
-                except (PermanentDownloadError, RangeNotSupportedError):
+                except (PermanentDownloadError, RangeNotSupportedError, TaskError):
                     raise
                 except Exception as e:
                     if isinstance(e, OSError) and e.errno in FATAL_IO_ERRNO:
@@ -342,13 +376,23 @@ class HttpTaskStep(TaskStep):
                 try:
                     ftruncate(fd, 0)
                     subworker.receivedBytes = 0
-                    response = await client.get(self._effectiveUrl, headers=dict(self._effectiveHeaders))
+                    headers = {**self._effectiveHeaders, "accept-encoding": "identity"}
+                    response = await client.get(self._effectiveUrl, headers=headers)
+                    expectedLength: int | None = None
                     try:
                         status = response.status.as_int()
                         if status in PERMANENT_STATUS or response.headers.contains_key("cf-mitigated"):
                             raise PermanentDownloadError(status)
+                        if status in {200, 206} and isUnexpectedHtml(response, self.outputPath):
+                            raise TaskError(HTML_RESPONSE_ERROR)
                         if status != 200:
                             raise Exception(f"服务器返回了异常状态码：{status}")
+                        length = bytes(response.headers.get("content-length") or b"").strip()
+                        if length.isdigit():
+                            expectedLength = int(length)
+                            self.fileSize = expectedLength
+                            if isinstance(self.task, HttpTask):
+                                self.task.fileSize = expectedLength
                         async for chunk in response.stream():
                             if isinstance(chunk, HeaderMap) or not chunk:
                                 continue
@@ -360,11 +404,13 @@ class HttpTaskStep(TaskStep):
                                 break
                     finally:
                         response.close()
+                    if not self.isFinishing and expectedLength is not None and subworker.receivedBytes != expectedLength:
+                        raise Exception("服务器返回的数据不完整")
                     ftruncate(fd, subworker.receivedBytes)
                     return
                 except CancelledError:
                     raise
-                except PermanentDownloadError:
+                except (PermanentDownloadError, TaskError):
                     raise
                 except Exception as e:
                     if isinstance(e, OSError) and e.errno in FATAL_IO_ERRNO:
@@ -402,6 +448,8 @@ class HttpTaskStep(TaskStep):
                         status = response.status.as_int()
                         if status in PERMANENT_STATUS or response.headers.contains_key("cf-mitigated"):
                             raise PermanentDownloadError(status)
+                        if status in {200, 206} and isUnexpectedHtml(response, self.outputPath):
+                            raise TaskError(HTML_RESPONSE_ERROR)
                         if shouldConfirmFileSize:
                             if status != 200:
                                 raise Exception(f"服务器返回了异常状态码：{status}")
@@ -455,7 +503,7 @@ class HttpTaskStep(TaskStep):
 
                 except CancelledError:
                     raise
-                except (PermanentDownloadError, RangeNotSupportedError):
+                except (PermanentDownloadError, RangeNotSupportedError, TaskError):
                     raise
                 except Exception as e:
                     if isinstance(e, OSError) and e.errno in FATAL_IO_ERRNO:
@@ -530,6 +578,9 @@ class HttpTaskStep(TaskStep):
                     self.setStatus(TaskStatus.PAUSED)
                     raise
                 except ExceptionGroup as eg:
+                    taskError = next((e for e in eg.exceptions if isinstance(e, TaskError)), None)
+                    if taskError is not None:
+                        raise taskError from eg
                     if any(isinstance(e, RangeNotSupportedError) for e in eg.exceptions):
                         if isResuming:
                             # https://github.com/XiaoYouChR/Ghost-Downloader-3/issues/377
