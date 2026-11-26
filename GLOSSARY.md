@@ -32,7 +32,7 @@ Task 加入时为它将产出的每个最终路径（成品和 Side File）创�
 _Avoid_: 占位符文件、lock file
 
 **Default Folder**:
-新 Task 的 Output Folder 初始值，由用户在设置中指定。
+用户在设置中指定的基准下载目录，用于 Category 的 `{default}` 模板，并在未开启 "使用上次使用的文件夹" 或尚无记录时作为新 Task 的初始 Output Folder；开启该设置时优先使用上次通过界面成功确认或修改的 Output Folder，修改 Default Folder 后回到新的 Default Folder。
 文件夹不存在（如移动硬盘未接入）时保持原样，应用不替用户改动。
 _Avoid_: 下载路径、默认目录
 
@@ -281,7 +281,7 @@ _Avoid_: 上传限速、某个协议自己的最大速度
 带可选 TLS 指纹模拟的 HTTP 客户端。
 
 **Plan**:
-"所有任务完成后做 X" 的意图：关机、重启、休眠或打开文件。
+"所有任务完成后做 X" 的意图：关机、重启、睡眠、退出程序或打开文件。
 
 **Settings**:
 应用级用户配置。
@@ -318,7 +318,7 @@ Inno Setup 写在 App Dir 里的卸载程序与日志。
 _Avoid_: setup、installer
 
 **Patch**:
-一份目录级增量文件。
+一份应用增量文件：桌面端按目录生成，Android 按安装包生成。
 _Avoid_: delta、diff
 
 **Staging**:
@@ -338,7 +338,7 @@ _Avoid_: old、prev
 _Avoid_: helper、installer
 
 **Apply**:
-退出时把已就绪的更新交出去：Pack 暂存到 Features Dir，应用则启动 Updater。
+把已就绪的更新交出去：桌面端在退出时暂存 Pack 并启动 Updater，Android 调起系统安装器。
 _Avoid_: install、commit
 
 **Install**:
